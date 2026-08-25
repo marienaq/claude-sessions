@@ -32,9 +32,27 @@ TASK_STATUSES = (
 )
 OPEN_STATUSES = ("backlog", "planned", "in_progress", "waiting", "review")
 
-PROJECT_STATUSES = ("active", "waiting", "parked", "closed")
+# What Phase 1 actually writes, which is not what the plan specified: it uses
+# done/cancelled where the plan said closed. Phase 1 is the running system and
+# build-dashboard.py treats ("done", "cancelled") as archived, so the store
+# follows it. 'closed' is accepted on the way in and folded into 'done'.
+PROJECT_STATUSES = ("active", "waiting", "parked", "done", "cancelled")
+ARCHIVED_PROJECT_STATUSES = ("done", "cancelled")
+_PROJECT_STATUS_ALIASES = {"closed": "done", "canceled": "cancelled",
+                           "complete": "done", "completed": "done"}
+
 LOADS = ("deep", "medium", "shallow")
 SOURCES = ("manual", "capture", "planning", "agent", "migration")
+
+# Phase 1 writes the literal string "none" for an absent date or id, and the
+# pre-Phase-1 files used several other sentinels. All of them mean NULL.
+_NULL_SENTINELS = {
+    "", "-", "--", "---", "none", "(none)", "n/a", "na", "tbd", "—",
+    "(no notion task)", "no notion task", "null",
+}
+
+# Owner is written as "MQ" in the markdown; the plan's enum is lower case.
+_OWNER_ALIASES = {"mq": "mq", "mariena": "mq", "": "mq"}
 
 # Reserved project for work that belongs to no project.
 ONE_OFF = "one-off"
@@ -223,6 +241,46 @@ def normalize_status(raw, default_year=None):
 
     done_at = extract_date(raw, default_year) if status == "done" else None
     return status, done_at, raw
+
+
+def clean(value):
+    """A markdown cell -> its value, or None if it is one of the null sentinels."""
+    if value is None:
+        return None
+    text = _strip_markdown(str(value))
+    return None if text.lower() in _NULL_SENTINELS else text or None
+
+
+def normalize_owner(value):
+    """'MQ' / '' / 'Mariena' -> 'mq'. Anything else lower-cased."""
+    text = (clean(value) or "").lower()
+    return _OWNER_ALIASES.get(text, text or "mq")
+
+
+def normalize_project_status(value):
+    """Fold the plan's vocabulary into what Phase 1 writes."""
+    text = (clean(value) or "active").lower()
+    text = _PROJECT_STATUS_ALIASES.get(text, text)
+    return text if text in PROJECT_STATUSES else "active"
+
+
+def is_struck_through(title):
+    """Phase 1 marks a task done by wrapping the title in ~~ as well."""
+    return bool(re.match(r"^\s*~~.+~~\s*$", (title or "").strip()))
+
+
+def clean_title(title):
+    """Strip the next-action arrow and strikethrough markers from a task cell."""
+    text = (title or "").strip()
+    text = re.sub(r"^\s*\*\*\s*", "", text)
+    text = re.sub(r"^\s*(→|->)\s*", "", text)
+    text = re.sub(r"^\s*~~\s*|\s*~~\s*$", "", text)
+    return _strip_markdown(text)
+
+
+def has_next_marker(title):
+    """The arrow lives at the start of the Task cell, sometimes behind bold."""
+    return bool(re.match(r"^\s*(\*\*\s*)?(→|->)", (title or "")))
 
 
 def slugify(text, max_len=48):

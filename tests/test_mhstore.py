@@ -123,6 +123,56 @@ class TestNormalizeStatus(unittest.TestCase):
         self.assertIsNone(done_at)
 
 
+class TestPhase1Conventions(unittest.TestCase):
+    """
+    Phase 1 writes conventions the plan did not specify. These lock them in
+    so migration and the plan cannot silently disagree.
+    """
+
+    def test_project_status_vocabulary_matches_phase1(self):
+        # build-dashboard.py archives on ("done", "cancelled"), not "closed".
+        for value in ("active", "waiting", "parked", "done", "cancelled"):
+            self.assertEqual(mhstore.normalize_project_status(value), value)
+
+    def test_closed_folds_into_done(self):
+        self.assertEqual(mhstore.normalize_project_status("closed"), "done")
+        self.assertEqual(mhstore.normalize_project_status("canceled"), "cancelled")
+
+    def test_project_status_defaults_to_active(self):
+        for value in ("", None, "none", "who knows"):
+            self.assertEqual(mhstore.normalize_project_status(value), "active")
+
+    def test_none_sentinels_become_null(self):
+        for value in ("none", "None", "(none)", "--", "-", "", "  ", "n/a",
+                      "(no Notion task)", "—", "TBD"):
+            self.assertIsNone(mhstore.clean(value),
+                              f"{value!r} should be NULL")
+
+    def test_real_values_survive_cleaning(self):
+        self.assertEqual(mhstore.clean("2026-08-24"), "2026-08-24")
+        self.assertEqual(mhstore.clean("`3416d218-9ed6`"), "3416d218-9ed6")
+
+    def test_owner_casing_normalized(self):
+        self.assertEqual(mhstore.normalize_owner("MQ"), "mq")
+        self.assertEqual(mhstore.normalize_owner(""), "mq")
+        self.assertEqual(mhstore.normalize_owner(None), "mq")
+        self.assertEqual(mhstore.normalize_owner("Jennifer"), "jennifer")
+
+    def test_arrow_stripped_from_title(self):
+        self.assertEqual(mhstore.clean_title("→ Review Sharla's feedback"),
+                         "Review Sharla's feedback")
+        self.assertEqual(mhstore.clean_title("**→ Draft the deck**"),
+                         "Draft the deck")
+        self.assertTrue(mhstore.has_next_marker("→ Review"))
+        self.assertTrue(mhstore.has_next_marker("**→ Review"))
+        self.assertFalse(mhstore.has_next_marker("Review the arrow → thing"))
+
+    def test_strikethrough_means_done(self):
+        self.assertTrue(mhstore.is_struck_through("~~Old task~~"))
+        self.assertFalse(mhstore.is_struck_through("Live task"))
+        self.assertEqual(mhstore.clean_title("~~Old task~~"), "Old task")
+
+
 class TestHelpers(unittest.TestCase):
 
     def test_extract_date_formats(self):
