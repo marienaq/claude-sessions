@@ -14,12 +14,25 @@ import time
 import urllib.parse
 from pathlib import Path
 
-PORT = 7433
-SESSIONS_FILE = Path.home() / ".claude-manager" / "sessions.json"
+# Everything below can be pointed at a scratch copy so a dev instance never
+# touches live state. See operations/prioritization-implementation-plan.md 5.7.
+#   MELLONHEAD_ROOT  the content repo to read (priorities.md, task lists, store)
+#   CSM_STATE_DIR    session-manager state (sessions.json, todos/)
+#   CSM_PORT         listen port; --port on the command line wins
+PORT = int(os.environ.get("CSM_PORT", "7433"))
+MELLONHEAD_ROOT = Path(
+    os.environ.get("MELLONHEAD_ROOT", Path.home() / "Projects" / "mellonhead")
+).expanduser()
+STATE_DIR = Path(
+    os.environ.get("CSM_STATE_DIR", Path.home() / ".claude-manager")
+).expanduser()
+
+SESSIONS_FILE = STATE_DIR / "sessions.json"
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-PRIORITIES_FILE = Path.home() / "Projects" / "mellonhead" / "priorities.md"
-TODOS_DIR = Path.home() / ".claude-manager" / "todos"
+PRIORITIES_FILE = MELLONHEAD_ROOT / "priorities.md"
+STORE_FILE = MELLONHEAD_ROOT / "operations" / "tasks.db"
+TODOS_DIR = STATE_DIR / "todos"
 TODOS_INDEX = TODOS_DIR / "index.json"
 INACTIVE_WINDOW_DAYS = 30
 INACTIVE_MAX = 200
@@ -3481,9 +3494,27 @@ setInterval(fetchSessions, 5000);
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Claude Session Manager")
+    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--root", type=Path, default=None,
+                    help="content repo to read (overrides MELLONHEAD_ROOT)")
+    args = ap.parse_args()
+
+    PORT = args.port
+    if args.root:
+        MELLONHEAD_ROOT = args.root.expanduser()
+        PRIORITIES_FILE = MELLONHEAD_ROOT / "priorities.md"
+        STORE_FILE = MELLONHEAD_ROOT / "operations" / "tasks.db"
+
     SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Claude Session Manager running at http://localhost:{PORT}")
+    print(f"  repo:  {MELLONHEAD_ROOT}")
+    print(f"  state: {STATE_DIR}")
+    if PORT != 7433:
+        print("  (dev instance — live manager is on 7433)")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
