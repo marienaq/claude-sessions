@@ -173,6 +173,42 @@ class TestPhase1Conventions(unittest.TestCase):
         self.assertEqual(mhstore.clean_title("~~Old task~~"), "Old task")
 
 
+class TestAmbiguousStatus(unittest.TestCase):
+    """
+    Prose cells that no rule classifies honestly. These get flagged for a
+    human instead of being guessed at silently.
+    """
+
+    def test_contradictory_cell_flagged(self):
+        # Reads as done; says the handoff is not done and is blocking someone.
+        self.assertTrue(mhstore.status_is_ambiguous(
+            "**Scope and objectives DONE 8/4. Anushka handoff NOT done. "
+            "Blocking her.**"))
+
+    def test_unrecognized_cell_flagged(self):
+        for raw in ("**Answered, date still open**",
+                    "MQ feedback processed; research dispatch pending",
+                    "Open program-design question"):
+            self.assertTrue(mhstore.status_is_ambiguous(raw), raw)
+
+    def test_terminal_plus_open_flagged(self):
+        # "Closed ... was 'Not Started'" carries both states at once.
+        self.assertTrue(mhstore.status_is_ambiguous(
+            'Closed 2026-08-24 (reconciliation: MQ confirmed both proposals '
+            'submitted 8/14; was "Not Started")'))
+
+    def test_two_open_states_not_flagged(self):
+        """Precedence resolves review-over-draft correctly; no human needed."""
+        for raw in ("Draft ready for MQ review", "**Draft ready for MQ review**"):
+            self.assertFalse(mhstore.status_is_ambiguous(raw), raw)
+            self.assertEqual(normalize_status(raw)[0], "review")
+
+    def test_plain_values_not_flagged(self):
+        for raw in ("Done", "Not started", "Killed", "In progress", "Waiting",
+                    "Blocked", "Done 2026-08-12", "", None):
+            self.assertFalse(mhstore.status_is_ambiguous(raw), repr(raw))
+
+
 class TestHelpers(unittest.TestCase):
 
     def test_extract_date_formats(self):

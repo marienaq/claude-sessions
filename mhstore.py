@@ -243,6 +243,36 @@ def normalize_status(raw, default_year=None):
     return status, done_at, raw
 
 
+def status_is_ambiguous(raw):
+    """
+    True when a Status cell is prose describing several states at once, or
+    names no state this code recognizes.
+
+    Some cells cannot be classified by rule and should not be guessed at:
+
+        "Scope and objectives DONE 8/4. Anushka handoff NOT done.
+         Blocking her."
+
+    Read literally that is done; read honestly it is blocked. Migration
+    lists these for a human rather than picking one silently. status_raw
+    keeps the original either way, so a ruling can be revised later.
+    """
+    flat = _prepare_status(raw)
+    if not flat.strip():
+        return False
+    matched = {s for pattern, s in _STATUS_RULES if re.search(pattern, flat)}
+    if not matched:
+        return True                      # fell through to the backlog default
+    # Two open states ("Draft ready for MQ review" is both review and draft)
+    # are resolved correctly by rule precedence and need no human. A terminal
+    # state next to an open one is a real contradiction.
+    terminal = matched & {"done", "canceled"}
+    still_open = matched & set(OPEN_STATUSES)
+    if terminal and still_open:
+        return True
+    return len(_strip_markdown(raw)) > 60
+
+
 def clean(value):
     """A markdown cell -> its value, or None if it is one of the null sentinels."""
     if value is None:
