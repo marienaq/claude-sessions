@@ -10,9 +10,16 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 import urllib.parse
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import mhstore
+except ImportError:                     # store not installed; markdown only
+    mhstore = None
 
 # Everything below can be pointed at a scratch copy so a dev instance never
 # touches live state. See operations/prioritization-implementation-plan.md 5.7.
@@ -44,6 +51,48 @@ STATE_CATEGORIES = (
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# The task store
+#
+# The store is the record. The markdown readers below it are kept as a
+# fallback for the dual-live window and for a rollback: if tasks.db is absent
+# or holds no week, the dashboard still renders from priorities.md rather than
+# going blank. See the plan's cutover steps 4 and 6.
+# ---------------------------------------------------------------------------
+
+_STORE = None
+
+
+def get_store():
+    """Open the store once per process. None if it is unavailable."""
+    global _STORE
+    if mhstore is None:
+        return None
+    if _STORE is None:
+        try:
+            if not STORE_FILE.exists():
+                return None
+            _STORE = mhstore.open_store(root=MELLONHEAD_ROOT,
+                                        seed_settings=False)
+        except Exception as exc:
+            print(f"store unavailable, falling back to markdown: {exc}")
+            return None
+    return _STORE
+
+
+def store_is_live():
+    """True when the store holds a week worth rendering."""
+    store = get_store()
+    if store is None:
+        return False
+    try:
+        return bool(store.conn.execute(
+            "SELECT 1 FROM tasks WHERE planned_day IS NOT NULL LIMIT 1"
+        ).fetchone())
+    except Exception:
+        return False
+
 
 def load_store():
     if SESSIONS_FILE.exists():
@@ -176,6 +225,69 @@ def find_task_list(cwd):
             except PermissionError:
                 continue
     return None
+
+
+def project_for_cwd(cwd):
+    """
+    The store project whose directory contains `cwd`, deepest match first.
+
+    Replaces walking the filesystem for a task-list.md: the store knows which
+    directory belongs to which project.
+    """
+    store = get_store()
+    if store is None or not cwd:
+        return None
+    try:
+        target = Path(cwd).resolve()
+    except OSError:
+        return None
+    best, best_len = None, -1
+    for project in store.projects():
+        if not project["dir"]:
+            continue
+        base = (MELLONHEAD_ROOT / project["dir"]).resolve()
+        if target == base or str(target).startswith(str(base) + os.sep):
+            if len(str(base)) > best_len:
+                best, best_len = project, len(str(base))
+    return best
+
+
+def task_list_from_store(project_key):
+    """The task panel's payload, read from the store instead of markdown."""
+    store = get_store()
+    if store is None:
+        return None
+    project = store.project(project_key)
+    if project is None:
+        return None
+    rows = store.tasks(project_key=project_key)
+    result = {
+        "file": str(MELLONHEAD_ROOT / project["dir"]) if project["dir"] else "",
+        "projectKey": project["key"],
+        "projectName": project["name"],
+        "notionProjectId": project["notion_project_id"] or "",
+        "status": project["status"],
+        "source": "store",
+        "tasks": [{
+            "id": row["id"],
+            "number": row["display_ord"] or row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "statusRaw": row["status_raw"] or row["status"],
+            "notionTaskId": row["notion_task_id"] or "",
+            "notes": "",
+            "notePath": row["note_path"],
+            "owner": row["owner"],
+            "seq": row["seq"],
+            "due": row["due"],
+            "section": row["section"],
+        } for row in rows],
+    }
+    nxt = store.next_task(project_key)
+    if nxt:
+        result["nextStep"] = next(
+            (t for t in result["tasks"] if t["id"] == nxt["id"]), None)
+    return result
 
 
 def parse_task_list(path):
@@ -328,10 +440,124 @@ def _parse_week_section(content, match):
     return days, blocked
 
 
+DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+             "Saturday", "Sunday")
+
+
+def _week_start_for(day):
+    """The Monday on or before `day`."""
+    import datetime
+    return day - datetime.timedelta(days=day.weekday())
+
+
+def _priority_item(task):
+    """One day-card line, in the shape the front end already renders."""
+    tag = (f"{task['project_key']}#{task['display_ord']}"
+           if task["display_ord"] else None)
+    return {
+        "id": task["id"],
+        "text": task["title"],
+        "done": task["status"] == "done",
+        "key": tag,
+        "project": task["project_key"],
+        "load": task["load"],
+        "owner": task["owner"],
+        "notePath": task["note_path"],
+    }
+
+
+def _week_from_store(store, week_start):
+    """Day cards for one week, Monday first, empty days dropped."""
+    import datetime
+    rows = store.conn.execute(
+        """SELECT * FROM tasks
+           WHERE planned_day >= ? AND planned_day <= date(?, '+6 day')
+           ORDER BY planned_day, seq IS NULL, seq, id""",
+        (week_start.isoformat(), week_start.isoformat())).fetchall()
+    by_day = {}
+    for row in rows:
+        by_day.setdefault(row["planned_day"], []).append(dict(row))
+    days = []
+    for offset in range(7):
+        day = week_start + datetime.timedelta(days=offset)
+        items = by_day.get(day.isoformat(), [])
+        if not items:
+            continue
+        days.append({
+            "day": f"{DAY_NAMES[day.weekday()]} {day.month}/{day.day}",
+            "date": day.isoformat(),
+            "items": [_priority_item(t) for t in items],
+        })
+    return days
+
+
+def load_priorities():
+    """
+    The current and next week, read from the store.
+
+    Falls back to the markdown parser when the store has no week, so the
+    dashboard keeps working during the dual-live window.
+    """
+    import datetime
+    store = get_store()
+    if store is None or not store_is_live():
+        return parse_priorities_markdown()
+
+    today = datetime.date.today()
+    this_monday = _week_start_for(today)
+
+    planned = [r["planned_day"] for r in store.conn.execute(
+        "SELECT DISTINCT planned_day FROM tasks "
+        "WHERE planned_day IS NOT NULL ORDER BY planned_day")]
+    if not planned:
+        return parse_priorities_markdown()
+
+    starts = sorted({_week_start_for(datetime.date.fromisoformat(p))
+                     for p in planned})
+    current = [s for s in starts if s <= this_monday]
+    if current:
+        selected, has_current = [current[-1]], True
+    else:
+        selected, has_current = [starts[0]], False
+    following = [s for s in starts if s > selected[0]]
+    if following:
+        selected.append(following[0])
+
+    weeks = []
+    for pos, start in enumerate(selected):
+        row = store.week(start.isoformat())
+        label = (row or {}).get("notes") or start.strftime("Week of %B %-d, %Y")
+        weeks.append({
+            "title": label,
+            "weekStart": start.isoformat(),
+            "days": _week_from_store(store, start),
+            "isCurrent": has_current and pos == 0,
+            "locked": bool((row or {}).get("locked_at")),
+        })
+
+    blocked = [_priority_item(dict(r)) for r in store.conn.execute(
+        "SELECT * FROM tasks WHERE status = 'waiting' AND planned_day IS NULL "
+        "ORDER BY project_key, id")]
+
+    return {
+        "weekTitle": weeks[0]["title"],
+        "days": weeks[0]["days"],
+        "blocked": blocked,
+        "weeks": weeks,
+        "noCurrentWeek": not has_current,
+        "source": "store",
+    }
+
+
 def parse_priorities():
+    """Entry point used by the handlers. Store first, markdown as a fallback."""
+    return load_priorities()
+
+
+def parse_priorities_markdown():
     """Parse priorities.md to extract daily goals for current + next week."""
     if not PRIORITIES_FILE.exists():
-        return {"days": [], "blocked": [], "weeks": []}
+        return {"days": [], "blocked": [], "weeks": [], "source": "markdown"}
 
     with open(PRIORITIES_FILE) as f:
         content = f.read()
@@ -342,7 +568,7 @@ def parse_priorities():
     # headers look like `**Week of Aug 3, 2026**` or `... 2026** -- suffix`.
     week_matches = [m for m in week_matches if not m.group(1).rstrip().endswith(":")]
     if not week_matches:
-        return {"days": [], "blocked": [], "weeks": []}
+        return {"days": [], "blocked": [], "weeks": [], "source": "markdown"}
 
     import datetime
     today = datetime.date.today()
@@ -390,6 +616,7 @@ def parse_priorities():
         "blocked": all_blocked,
         "weeks": weeks,
         "noCurrentWeek": not has_current,
+        "source": "markdown",
     }
 
 
@@ -400,7 +627,19 @@ def get_today_day_name():
 
 
 def match_priority_to_session(item, session, task_assignments):
-    """Match a priority item to a session. Prefer Notion ID; fall back to fuzzy."""
+    """
+    Match a priority item to a session.
+
+    The store gives every row a project, so a day-card line and a session
+    working in that project's directory match exactly. That runs before the
+    Notion id and well before the keyword guess below it.
+    """
+    project_key = item.get("project")
+    if project_key and project_key != "one-off":
+        session_project = (session.get("taskList") or {}).get("projectKey")
+        if session_project:
+            return session_project == project_key
+
     notion_id = item.get("notionTaskId", "")
 
     if notion_id:
@@ -989,17 +1228,26 @@ def get_all_sessions():
             pass  # Explicitly unlinked, skip auto-discovery
         elif linked_task_file and Path(linked_task_file).exists():
             try:
-                task_list = parse_task_list(Path(linked_task_file))
+                # An explicit link points at a markdown file; resolve it to
+                # the owning project so the panel still reads from the store.
+                linked = project_for_cwd(str(Path(linked_task_file).parent))
+                task_list = (task_list_from_store(linked["key"]) if linked
+                             else None) or parse_task_list(Path(linked_task_file))
             except Exception as e:
                 print(f"Task parse error for {linked_task_file}: {e}")
         else:
-            task_file = find_task_list(cwd) if cwd else None
-            if task_file:
-                try:
-                    task_list = parse_task_list(task_file)
-                    is_auto_linked = True
-                except Exception as e:
-                    print(f"Task parse error for {task_file}: {e}")
+            project = project_for_cwd(cwd) if cwd else None
+            if project:
+                task_list = task_list_from_store(project["key"])
+                is_auto_linked = task_list is not None
+            if task_list is None:
+                task_file = find_task_list(cwd) if cwd else None
+                if task_file:
+                    try:
+                        task_list = parse_task_list(task_file)
+                        is_auto_linked = True
+                    except Exception as e:
+                        print(f"Task parse error for {task_file}: {e}")
 
         # Auto tags
         auto = auto_tags_from_path(cwd) if cwd else []
@@ -1306,6 +1554,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_body()
             text = body.get("text", "").strip()
             done = body.get("done", False)
+            task_id = body.get("id")
+
+            # The store path is exact: the checkbox carries the task's id, so
+            # there is no text matching and no ambiguity when two day-card
+            # lines read alike.
+            store = get_store()
+            if task_id is not None and store is not None:
+                try:
+                    task = store.task(int(task_id))
+                except (TypeError, ValueError):
+                    task = None
+                if task is None:
+                    self.send_json({"ok": False, "error": "No such task"}, 404)
+                    return
+                if done:
+                    store.complete_task(task["id"], actor="mq")
+                else:
+                    store.reopen_task(task["id"], actor="mq",
+                                      status="planned" if task["planned_day"]
+                                      else "backlog")
+                self.send_json({"ok": True, "id": task["id"]})
+                return
+
             if text and PRIORITIES_FILE.exists():
                 with open(PRIORITIES_FILE) as f:
                     content = f.read()
@@ -1462,6 +1733,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_body()
             task_file = body.get("taskFile", "").strip()
             task_number = body.get("taskNumber", 0)
+
+            # Same single close path as the checkbox: one write, by id.
+            store = get_store()
+            task_id = body.get("id")
+            if task_id is not None and store is not None:
+                try:
+                    task = store.task(int(task_id))
+                except (TypeError, ValueError):
+                    task = None
+                if task is None:
+                    self.send_json({"ok": False, "error": "No such task"}, 404)
+                    return
+                store.complete_task(task["id"], actor="mq")
+                nxt = store.next_task(task["project_key"])
+                self.send_json({"ok": True, "id": task["id"],
+                                "next": nxt["title"] if nxt else None})
+                return
+
             if task_file and task_number:
                 expanded = str(Path(task_file).expanduser())
                 if Path(expanded).exists():
@@ -1489,6 +1778,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_body()
             task_file = body.get("taskFile", "").strip()
             title = body.get("title", "").strip()
+
+            store = get_store()
+            project_key = body.get("projectKey")
+            if store is not None and title and (project_key or task_file):
+                if not project_key:
+                    project = project_for_cwd(str(Path(task_file).expanduser().parent))
+                    project_key = project["key"] if project else None
+                if project_key and store.project(project_key):
+                    task = store.add_task(
+                        project_key, title, actor="mq", source="manual",
+                        status="backlog", planned_day=body.get("plannedDay"),
+                        load=body.get("load"), due=body.get("due"))
+                    self.send_json({"ok": True, "id": task["id"],
+                                    "taskNumber": task["id"],
+                                    "projectKey": project_key})
+                    return
+
             if task_file and title:
                 expanded = str(Path(task_file).expanduser())
                 if Path(expanded).exists():
@@ -1522,6 +1828,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/task-tasks":
             body = self.read_body()
             task_file = body.get("taskFile", "").strip()
+
+            project_key = body.get("projectKey")
+            if not project_key and task_file:
+                project = project_for_cwd(str(Path(task_file).expanduser().parent))
+                project_key = project["key"] if project else None
+            if project_key:
+                payload = task_list_from_store(project_key)
+                if payload is not None:
+                    self.send_json(payload)
+                    return
+
             if task_file:
                 expanded = str(Path(task_file).expanduser())
                 if Path(expanded).exists():
@@ -1922,6 +2239,15 @@ body {
     transition: all 0.15s;
 }
 .priority-check:hover { background: var(--accent-dim); color: var(--accent); transform: scale(1.2); }
+.priority-text { flex: 1; min-width: 0; }
+.priority-load {
+    flex-shrink: 0;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.5;
+    align-self: center;
+}
 
 /* Inline Tag Cloud */
 .tag-cloud-inline {
@@ -2574,24 +2900,34 @@ async function mapPriorities() {
     fetchSessions();
 }
 
-async function togglePriorityItem(text, done) {
-    await fetch('/api/toggle-priority-item', {
+async function togglePriorityItem(text, done, id) {
+    const res = await fetch('/api/toggle-priority-item', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text, done})
+        body: JSON.stringify({text, done, id})
     });
     fetchSessions(true);
+    return res.ok;
 }
 
 function togglePriorityItemFromEl(el) {
     const text = el.dataset.text || '';
+    // The store gives every row an id, so the write targets a row rather
+    // than matching on the line's text.
+    const id = el.dataset.id ? Number(el.dataset.id) : null;
     const wasDone = el.dataset.done === '1';
     // Optimistic UI flip so the user sees immediate feedback
     el.classList.toggle('done', !wasDone);
     el.dataset.done = wasDone ? '0' : '1';
     const check = el.querySelector('.priority-check');
     if (check) check.textContent = wasDone ? '○' : '✓';
-    togglePriorityItem(text, !wasDone);
+    togglePriorityItem(text, !wasDone, id).then(ok => {
+        if (ok) return;
+        // Put it back rather than showing a state the store does not hold.
+        el.classList.toggle('done', wasDone);
+        el.dataset.done = wasDone ? '1' : '0';
+        if (check) check.textContent = wasDone ? '✓' : '○';
+    });
 }
 
 function setFilter(tag) {
@@ -2657,9 +2993,10 @@ function renderPriorities() {
         <div class="priorities-days">
             ${w.days.map(d => `<div class="priority-day">
                 <div class="priority-day-name">${escHtml(d.day)}</div>
-                ${d.items.map(item => `<div class="priority-item ${item.done ? 'done' : ''}" data-text="${escAttr(item.text)}" data-done="${item.done ? '1' : '0'}" onclick="togglePriorityItemFromEl(this)">
+                ${d.items.map(item => `<div class="priority-item ${item.done ? 'done' : ''}" data-text="${escAttr(item.text)}"${item.id != null ? ` data-id="${item.id}"` : ''} data-done="${item.done ? '1' : '0'}" onclick="togglePriorityItemFromEl(this)" title="${escAttr(item.key || item.text)}">
                     <span class="priority-check">${item.done ? '✓' : '○'}</span>
                     <span class="priority-text">${escHtml(item.text)}</span>
+                    ${item.load ? `<span class="priority-load">${escHtml(item.load)}</span>` : ''}
                 </div>`).join('')}
             </div>`).join('')}
         </div>
