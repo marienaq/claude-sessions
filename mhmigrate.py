@@ -34,6 +34,10 @@ NOTE_THRESHOLD = 200
 SKIP_DIR_PARTS = ("operations/backups", "/archive/", "mellonhead-archive")
 
 TASK_HEADER = re.compile(r"^\|.*\|\s*Task\s*\|.*Notion Task ID", re.I)
+# A row that loses its leading pipe stops being a table row. It is then not
+# malformed, it is invisible: no parser sees it and no report mentions it.
+# This catches "24 | Task | ..." so a hand-edit cannot delete work silently.
+ORPHAN_ROW = re.compile(r"^\s+\S[^|\n]{0,40}\|(?:[^|\n]*\|){3,}")
 DIVIDER = re.compile(r"^\|[\s\-:|]+\|$")
 HEADING = re.compile(r"^(#{2,4})\s+(.*)$")
 YAML_FENCE = "```yaml"
@@ -66,6 +70,7 @@ class Report:
         self.duplicates = []     # (path, same_as)
         self.unregistered = []   # (path,)
         self.non_iso_dates = []  # (key, title, value)
+        self.orphan_rows = []    # (path, line_no, text) — lost its leading pipe
         self.no_seq = []         # (key, open_count)
 
     def add_ambiguous(self, key, title, raw, decided):
@@ -165,6 +170,8 @@ def parse_task_rows(lines, report, path):
             in_table = False
             continue
         if not line.startswith("|"):
+            if ORPHAN_ROW.match(line):
+                report.orphan_rows.append((path, i, line.strip()[:60]))
             in_table = False
             continue
         if TASK_HEADER.match(line):
@@ -428,6 +435,9 @@ def print_report(report, dry_run):
             lambda a: f"[{a[3]:11}] {a[0]:18} {a[1][:34]:36} {a[2][:52]}")
     section("duplicate files skipped", report.duplicates,
             lambda d: f"{d[0]}  identical to  {d[1]}")
+    section("ROWS THAT LOST THEIR LEADING PIPE — invisible to every parser",
+            report.orphan_rows,
+            lambda o: f"{o[0]}:{o[1]}  {o[2]}")
     section("malformed rows skipped", report.malformed,
             lambda m: f"{m[0]}:{m[1]}  {m[2]} cells, header has {m[3]}")
     section("non-ISO due dates dropped", report.non_iso_dates,

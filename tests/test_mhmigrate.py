@@ -277,6 +277,34 @@ class TestDuplicatesAndAnomalies(MigrationCase):
         self.assertEqual(report.malformed[0][2], 5)
         self.assertEqual(report.malformed[0][3], 8)
 
+    def test_row_missing_leading_pipe_is_reported(self):
+        """
+        A hand-edit that strips the leading pipe makes a row invisible: it is
+        not a table row, so it is not even malformed. Work disappears with no
+        error anywhere. This happened for real; it must never be silent.
+        """
+        path = self.repo / "p" / "task-list.md"
+        make_list(path, "p", [{"n": 1, "task": "Good row"}])
+        with open(path, "a") as f:
+            f.write(" 2 | Orphaned row | Not started | none |  | MQ |  | 20 \n")
+        self.register("p", "p/task-list.md")
+        store, report = self.run_migration()
+
+        self.assertEqual(len(report.orphan_rows), 1,
+                         "a row without its leading pipe must be reported")
+        self.assertIn("Orphaned row", report.orphan_rows[0][2])
+        self.assertEqual(report.tasks, 1)
+
+    def test_normal_prose_is_not_mistaken_for_an_orphan_row(self):
+        path = self.repo / "p" / "task-list.md"
+        make_list(path, "p", [{"n": 1, "task": "Good row"}])
+        with open(path, "a") as f:
+            f.write("\nSome prose about A | B choices and other things.\n")
+            f.write("\n> A quote with a | pipe in it.\n")
+        self.register("p", "p/task-list.md")
+        store, report = self.run_migration()
+        self.assertEqual(report.orphan_rows, [])
+
     def test_non_iso_due_reported_and_dropped(self):
         make_list(self.repo / "p" / "task-list.md", "p",
                   [{"n": 1, "task": "Standing item", "due": "recurring"}])
