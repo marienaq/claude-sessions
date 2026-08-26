@@ -64,8 +64,11 @@ class MigrationCase(unittest.TestCase):
         self.repo = Path(self._tmp.name)
         (self.repo / "operations").mkdir(parents=True, exist_ok=True)
         self.registry_rows = []
+        self._stores = []
 
     def tearDown(self):
+        for store in self._stores:
+            store.close()
         self._tmp.cleanup()
 
     def register(self, key, rel_path, name=None):
@@ -83,6 +86,7 @@ class MigrationCase(unittest.TestCase):
     def run_migration(self, **kwargs):
         self.write_registry()
         store = mhstore.open_store(root=self.repo)
+        self._stores.append(store)
         report = mhmigrate.migrate(self.repo, store, **kwargs)
         return store, report
 
@@ -356,6 +360,7 @@ class TestDryRunAndIdempotency(MigrationCase):
         self._fixture()
         self.write_registry()
         store = mhstore.open_store(root=self.repo)
+        self._stores.append(store)
         mhmigrate.migrate(self.repo, store)
         first = len(store.tasks())
         mhmigrate.migrate(self.repo, store)
@@ -370,6 +375,124 @@ class TestDryRunAndIdempotency(MigrationCase):
         text = id_map.read_text()
         self.assertIn("project,old_row,new_id,title,source_line", text)
         self.assertIn("p,1,", text)
+
+
+PRIORITIES = """# Priorities
+
+## Capacity Dashboard
+
+**Week of August 24, 2026:** a passing reference that is not the header.
+
+**Week of August 24, 2026** (confirmed by MQ)
+
+## Weekly Goals
+
+### Monday 8/24 | ABA, admin-heavy
+
+- [x] **Tagged and finished** [Shallow]. `p#1` (done 2026-08-24)
+- [ ] **Tagged and open** [Deep]. `p#2`
+- [ ] **No tag at all**, just a line.
+
+### Tuesday 8/25 | Outreach
+
+- [ ] **Second pass on the same task** [Medium]. `p#2`
+
+### Blocked or waiting
+
+- [ ] **Also on a day card** `p#2`
+- [ ] **Only blocked** `p#3`
+
+---
+
+## Backlog
+
+- [ ] **Sitting in the backlog** `p#4`
+"""
+
+
+class TestPriorities(MigrationCase):
+    """
+    priorities.md is where the week lives. Without it the store has no
+    planned_day and the dashboard renders an empty week.
+    """
+
+    def setUp(self):
+        super().setUp()
+        make_list(self.repo / "p" / "task-list.md", "p",
+                  [{"n": 1, "task": "One"}, {"n": 2, "task": "Two"},
+                   {"n": 3, "task": "Three"}, {"n": 4, "task": "Four"}])
+        self.register("p", "p/task-list.md")
+        (self.repo / "priorities.md").write_text(PRIORITIES)
+
+    def _by_ord(self, store):
+        return {t["display_ord"]: t for t in store.tasks(project_key="p")}
+
+    def test_week_header_picked_from_the_right_line(self):
+        week = mhmigrate.parse_priorities_file(self.repo)
+        self.assertEqual(week["week_start"], "2026-08-24")
+        self.assertEqual(len(week["days"]), 2)
+
+    def test_day_cards_get_planned_day(self):
+        store, report = self.run_migration()
+        tasks = self._by_ord(store)
+        self.assertEqual(tasks["1"]["planned_day"], "2026-08-24")
+        self.assertEqual(tasks["2"]["planned_day"], "2026-08-24")
+
+    def test_checkbox_marks_done(self):
+        store, _ = self.run_migration()
+        self.assertEqual(self._by_ord(store)["1"]["status"], "done")
+
+    def test_load_tag_captured(self):
+        store, _ = self.run_migration()
+        tasks = self._by_ord(store)
+        self.assertEqual(tasks["1"]["load"], "shallow")
+        self.assertEqual(tasks["2"]["load"], "deep")
+
+    def test_blocked_does_not_clear_a_planned_day(self):
+        """
+        p#2 is on Monday's card and also under Blocked. The blocked pass runs
+        later and must not evict it from the week.
+        """
+        store, _ = self.run_migration()
+        self.assertEqual(self._by_ord(store)["2"]["planned_day"], "2026-08-24")
+
+    def test_backlog_does_not_clear_a_planned_day(self):
+        store, _ = self.run_migration()
+        planned = [t for t in store.tasks() if t["planned_day"]]
+        self.assertEqual(len(planned), 3, "one per distinct day-card line")
+
+    def test_multi_day_keeps_the_first_and_reports(self):
+        """p#2 is on Monday and Tuesday. A task has one planned_day."""
+        store, report = self.run_migration()
+        self.assertEqual(self._by_ord(store)["2"]["planned_day"], "2026-08-24")
+        self.assertEqual(len(report.priority_multi_day), 1)
+        tag, kept, also, _ = report.priority_multi_day[0]
+        self.assertEqual((tag, kept, also), ("p#2", "2026-08-24", "2026-08-25"))
+
+    def test_blocked_only_row_gets_no_day(self):
+        store, _ = self.run_migration()
+        self.assertIsNone(self._by_ord(store)["3"]["planned_day"])
+
+    def test_untagged_line_becomes_a_one_off(self):
+        store, report = self.run_migration()
+        one_offs = store.tasks(project_key=mhstore.ONE_OFF)
+        self.assertEqual(len(one_offs), 1)
+        self.assertEqual(one_offs[0]["title"], "No tag at all, just a line")
+        self.assertEqual(one_offs[0]["planned_day"], "2026-08-24")
+        self.assertEqual(len(report.priority_unmatched), 1)
+
+    def test_week_row_created(self):
+        store, _ = self.run_migration()
+        self.assertIsNotNone(store.week("2026-08-24"))
+
+    def test_day_card_never_reopens_finished_work(self):
+        """The task list is the authority on done, not the checkbox."""
+        make_list(self.repo / "p" / "task-list.md", "p",
+                  [{"n": 1, "task": "One"},
+                   {"n": 2, "task": "Two", "status": "Done"},
+                   {"n": 3, "task": "Three"}, {"n": 4, "task": "Four"}])
+        store, _ = self.run_migration()
+        self.assertEqual(self._by_ord(store)["2"]["status"], "done")
 
 
 class TestVerify(MigrationCase):

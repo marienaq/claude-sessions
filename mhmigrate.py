@@ -45,6 +45,26 @@ KEY_DECISIONS = re.compile(r"^##\s+Key Decisions", re.I)
 # ken-yarmosh keeps each task's real content in "## N. <title>" sections.
 NARRATIVE = re.compile(r"^##\s+(\d+)\.\s+(.*)$")
 
+# priorities.md: the week, its day cards, and the checkbox lines under them.
+WEEK_HEADER = re.compile(r"^\*\*Week of ([^*]+?)\*\*")
+WEEKLY_GOALS = re.compile(r"^##\s+Weekly Goals\b", re.I)
+BLOCKED_HEADER = re.compile(r"^#{2,3}\s+Blocked or waiting\b", re.I)
+BACKLOG_HEADER = re.compile(r"^##\s+Backlog\b", re.I)
+DAY_CARD = re.compile(
+    r"^###\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
+    r"(\d{1,2})/(\d{1,2})", re.I)
+CHECKBOX = re.compile(r"^\s*-\s+\[([ xX])\]\s+(.*)$")
+# `aba-academy#25` — the tag Phase 0 put on day-card lines so a checkbox has
+# an exact target instead of a text match.
+KEY_TAG = re.compile(r"`([a-z0-9][a-z0-9-]*)#(\d+)`")
+LOAD_TAG = re.compile(r"\[(deep|medium|shallow)\b", re.I)
+DONE_SUFFIX = re.compile(r"\s*\((?:done|closed)\s+[0-9-/]+\)\s*$", re.I)
+
+MONTH_DAY_YEAR = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),?\s*(\d{4})")
+MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"], start=1)}
+
 
 def split_cells(line):
     parts = line.split("|")
@@ -72,6 +92,12 @@ class Report:
         self.non_iso_dates = []  # (key, title, value)
         self.orphan_rows = []    # (path, line_no, text) — lost its leading pipe
         self.no_seq = []         # (key, open_count)
+        self.week = None
+        self.week_days = 0
+        self.priority_matched = 0
+        self.priority_one_offs = 0
+        self.priority_unmatched = []  # (title, when, why)
+        self.priority_multi_day = []  # (tag, kept_day, also_day, title)
 
     def add_ambiguous(self, key, title, raw, decided):
         self.ambiguous.append((key, title, raw, decided))
@@ -393,6 +419,8 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
                                str(found.relative_to(repo)))
         report.unregistered.append((str(found.relative_to(repo)), len(rows)))
 
+    migrate_priorities(repo, store, report, dry_run=dry_run)
+
     if not dry_run:
         store.write_snapshot()
         write_id_map(repo, id_map)
@@ -422,6 +450,10 @@ def print_report(report, dry_run):
     print(f"  note files      {report.notes_written}"
           f"  ({report.note_chars:,} chars of prose moved out of table cells)")
     print(f"  decisions files {report.decisions_written}")
+    if report.week:
+        print(f"  week            {report.week}  ({report.week_days} day cards, "
+              f"{report.priority_matched} lines matched a task, "
+              f"{report.priority_one_offs} became one-offs)")
 
     def section(title, items, render):
         if not items:
@@ -433,6 +465,11 @@ def print_report(report, dry_run):
     section("NEEDS A RULING — status cells no rule reads honestly",
             report.ambiguous,
             lambda a: f"[{a[3]:11}] {a[0]:18} {a[1][:34]:36} {a[2][:52]}")
+    section("scheduled on more than one day (store keeps the first)",
+            report.priority_multi_day,
+            lambda m: f"{m[0]:22} kept {m[1]}  also {m[2]}  {m[3]}")
+    section("day-card lines with no task to attach to", report.priority_unmatched,
+            lambda u: f"{u[2]:20} {str(u[1] or '-'):12} {u[0]}")
     section("duplicate files skipped", report.duplicates,
             lambda d: f"{d[0]}  identical to  {d[1]}")
     section("ROWS THAT LOST THEIR LEADING PIPE — invisible to every parser",
@@ -450,6 +487,178 @@ def print_report(report, dry_run):
             report.unregistered,
             lambda u: f"{u[1]:>3} rows  {u[0]}")
     print()
+
+
+def strip_item_text(raw):
+    """A day-card line down to its title: no key tag, load tag, or done note."""
+    text = KEY_TAG.sub("", raw)
+    text = DONE_SUFFIX.sub("", text)
+    text = re.sub(r"\[(deep|medium|shallow)[^\]]*\]", "", text, flags=re.I)
+    return clean_title(text).strip(" .")
+
+
+def parse_priorities_file(repo):
+    """
+    The current week out of priorities.md: its start date, the day cards, the
+    blocked list and the backlog.
+
+    The file carries several "**Week of ...**" strings; the one that matters
+    is the last before "## Weekly Goals". The others are references inside the
+    capacity dashboard.
+    """
+    path = repo / "priorities.md"
+    if not path.exists():
+        return None
+    lines = path.read_text().splitlines()
+
+    try:
+        goals_at = next(i for i, l in enumerate(lines) if WEEKLY_GOALS.match(l))
+    except StopIteration:
+        return None
+
+    week_label, week_start = None, None
+    for line in reversed(lines[:goals_at]):
+        m = WEEK_HEADER.match(line)
+        if not m:
+            continue
+        label = m.group(1).strip()
+        dm = MONTH_DAY_YEAR.search(label)
+        if dm and dm.group(1).lower() in MONTHS:
+            from datetime import date as _date
+            week_label = label
+            week_start = _date(int(dm.group(3)), MONTHS[dm.group(1).lower()],
+                               int(dm.group(2))).isoformat()
+            break
+
+    days, blocked, backlog = [], [], []
+    current_day, bucket = None, None
+    for line in lines[goals_at + 1:]:
+        day = DAY_CARD.match(line)
+        if day:
+            from datetime import date as _date
+            year = int(week_start[:4]) if week_start else 2026
+            try:
+                iso = _date(year, int(day.group(2)), int(day.group(3))).isoformat()
+            except ValueError:
+                iso = None
+            current_day = {"day": day.group(1).title(), "date": iso, "items": []}
+            days.append(current_day)
+            bucket = "day"
+            continue
+        if BLOCKED_HEADER.match(line):
+            bucket, current_day = "blocked", None
+            continue
+        if BACKLOG_HEADER.match(line):
+            bucket, current_day = "backlog", None
+            continue
+        if line.startswith("## ") and not BACKLOG_HEADER.match(line):
+            bucket, current_day = None, None
+            continue
+        box = CHECKBOX.match(line)
+        if not box or bucket is None:
+            continue
+        tag = KEY_TAG.search(box.group(2))
+        load = LOAD_TAG.search(box.group(2))
+        item = {
+            "raw": box.group(2).strip(),
+            "title": strip_item_text(box.group(2)),
+            "done": box.group(1).lower() == "x",
+            "key": tag.group(1) if tag else None,
+            "ord": tag.group(2) if tag else None,
+            "load": load.group(1).lower() if load else None,
+        }
+        if not item["title"]:
+            continue
+        if bucket == "day" and current_day:
+            current_day["items"].append(item)
+        elif bucket == "blocked":
+            blocked.append(item)
+        elif bucket == "backlog":
+            backlog.append(item)
+
+    return {"label": week_label, "week_start": week_start,
+            "days": days, "blocked": blocked, "backlog": backlog}
+
+
+def migrate_priorities(repo, store, report, dry_run=False):
+    """
+    Put the current week into the store: planned_day on the tasks the day
+    cards point at, and a one-off row for the lines that point nowhere.
+
+    Tagged lines (`aba-academy#25`) resolve exactly. Untagged ones cannot be
+    matched safely by text, so they become one-off tasks rather than guessing
+    at which project row they meant.
+    """
+    week = parse_priorities_file(repo)
+    if not week:
+        return None
+
+    by_tag = {}
+    for task in store.tasks():
+        if task["display_ord"]:
+            by_tag[(task["project_key"], str(task["display_ord"]))] = task["id"]
+
+    scheduled = {}   # task id -> the first day it was seen on
+
+    def place(item, planned_day, status_hint):
+        target = by_tag.get((item["key"], item["ord"])) if item["key"] else None
+        if target is not None and target in scheduled:
+            # Either the same task sits on two day cards ("Thu first pass, Fri
+            # final"), or it is on a day card and also listed under blocked or
+            # backlog. A task has one planned_day, so keep the first day it
+            # was given and never let a later pass clear it.
+            if planned_day and planned_day != scheduled[target]:
+                report.priority_multi_day.append(
+                    (f"{item['key']}#{item['ord']}", scheduled[target],
+                     planned_day, item["title"][:44]))
+            return
+        if target is not None and planned_day:
+            scheduled[target] = planned_day
+        if target is None:
+            report.priority_unmatched.append(
+                (item["title"][:56], planned_day or status_hint,
+                 "tagged, no such row" if item["key"] else "untagged"))
+            if dry_run:
+                return
+            row = store.add_task(
+                mhstore.ONE_OFF, item["title"], actor="migration",
+                source="migration",
+                status="done" if item["done"] else status_hint,
+                planned_day=planned_day, load=item["load"],
+                done_at=None)
+            report.priority_one_offs += 1
+            return
+        report.priority_matched += 1
+        if dry_run:
+            return
+        # Only ever set a day, never clear one. Blocked and backlog entries
+        # carry no day and must not evict a task from the week.
+        fields = {"planned_day": planned_day} if planned_day else {}
+        if item["load"]:
+            fields["load"] = item["load"]
+        current = store.task(target)
+        # The task list is the authority on whether work is finished; the day
+        # card only says it was scheduled. Never un-finish a task from here.
+        if item["done"] and current["status"] not in ("done", "canceled"):
+            fields["status"] = "done"
+        elif not item["done"] and current["status"] not in ("done", "canceled"):
+            fields["status"] = status_hint
+        store.update_task(target, actor="migration", **fields)
+
+    for day in week["days"]:
+        for item in day["items"]:
+            place(item, day["date"], "planned")
+    for item in week["blocked"]:
+        place(item, None, "waiting")
+    for item in week["backlog"]:
+        place(item, None, "backlog")
+
+    if not dry_run and week["week_start"]:
+        store.upsert_week(week["week_start"], actor="migration",
+                          notes=week["label"])
+    report.week = week["week_start"]
+    report.week_days = len(week["days"])
+    return week
 
 
 def verify(repo, store, note_threshold=NOTE_THRESHOLD):
