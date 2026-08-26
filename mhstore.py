@@ -157,7 +157,10 @@ _STATUS_RULES = (
     (r"(~canceled|\b(killed|cancell?ed|superseded|dropped|abandoned)\b)", "canceled"),
     (r"\b(done|shipped|delivered|shared|complete|completed|closed|decided"
      r"|sent|submitted)\b",                           "done"),
-    (r"\b(blocked|waiting|on hold|held)\b",           "waiting"),
+    # "blocking" as well as "blocked": a row that is blocking someone else is
+    # not finished, and pairing it with a done word is exactly the
+    # contradiction status_is_ambiguous looks for.
+    (r"\b(block(ed|ing|s)?|waiting|on hold|held)\b", "waiting"),
     (r"\b(in progress|underway|ongoing|drafted|draft|scoping|started"
      r"|unblocked|rulings in)\b",                     "in_progress"),
     (r"(~backlog|\b(backlog|todo|to do)\b)",          "backlog"),
