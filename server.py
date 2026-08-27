@@ -549,6 +549,53 @@ def load_priorities():
     }
 
 
+def obsidian_url(rel_path):
+    """
+    obsidian:// link for a repo-relative file, so a note opens somewhere it
+    can be edited rather than read-only in a browser.
+    """
+    if not rel_path:
+        return None
+    target = MELLONHEAD_ROOT / rel_path
+    return "obsidian://open?path=" + urllib.parse.quote(str(target), safe="")
+
+
+def load_panels():
+    """Backlog, unconfirmed proposals, and the per-project next action."""
+    store = get_store()
+    if store is None or not store_is_live():
+        return {"backlog": [], "proposed": [], "projects": [], "available": False}
+
+    backlog, proposed = [], []
+    for row in store.conn.execute(
+            "SELECT * FROM tasks WHERE status = 'backlog' AND planned_day IS NULL "
+            "ORDER BY project_key, seq IS NULL, seq, id"):
+        item = _priority_item(dict(row))
+        (backlog if row["confirmed"] else proposed).append(item)
+
+    projects = []
+    for project in store.projects():
+        if project["status"] not in ("active", "waiting"):
+            continue
+        if project["key"] == mhstore.ONE_OFF:
+            continue
+        nxt = store.next_task(project["key"])
+        open_count = len([t for t in store.tasks(project_key=project["key"],
+                                                 open_only=True)])
+        projects.append({
+            "key": project["key"],
+            "name": project["name"],
+            "status": project["status"],
+            "due": project["due"],
+            "openCount": open_count,
+            "next": _priority_item(nxt) if nxt else None,
+            "notePath": obsidian_url(nxt["note_path"]) if nxt and nxt["note_path"] else None,
+        })
+    projects.sort(key=lambda p: (p["status"] != "active", p["key"]))
+    return {"backlog": backlog, "proposed": proposed, "projects": projects,
+            "available": True}
+
+
 def parse_priorities():
     """Entry point used by the handlers. Store first, markdown as a fallback."""
     return load_priorities()
@@ -1444,6 +1491,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({
                 "sessions": get_all_sessions(),
                 "priorities": parse_priorities(),
+                "panels": load_panels(),
                 "colorGroups": store.get("color_groups", {}),
             })
         elif self.path == "/api/task-files":
@@ -1600,6 +1648,87 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "Line not found"}, 400)
             else:
                 self.send_json({"ok": False}, 400)
+            return
+
+        # -------------------------------------------------------------
+        # Store write paths (2.4). Everything here addresses a row by id,
+        # so nothing depends on matching the text of a line.
+        # -------------------------------------------------------------
+        elif self.path.startswith("/api/task/") or self.path.startswith("/api/plan/"):
+            body = self.read_body()
+            store = get_store()
+            if store is None:
+                self.send_json({"ok": False, "error": "No store"}, 503)
+                return
+            action = self.path.rsplit("/", 1)[-1]
+
+            def wanted_task():
+                try:
+                    return store.task(int(body.get("id")))
+                except (TypeError, ValueError):
+                    return None
+
+            try:
+                if action == "add":
+                    title = (body.get("title") or "").strip()
+                    project_key = body.get("projectKey") or mhstore.ONE_OFF
+                    if not title:
+                        self.send_json({"ok": False, "error": "No title"}, 400)
+                        return
+                    if not store.project(project_key):
+                        self.send_json({"ok": False,
+                                        "error": f"No project {project_key}"}, 404)
+                        return
+                    task = store.add_task(
+                        project_key, title, actor="mq", source="manual",
+                        status="planned" if body.get("plannedDay") else "backlog",
+                        planned_day=body.get("plannedDay"),
+                        load=body.get("load"), due=body.get("due"))
+                    self.send_json({"ok": True, "id": task["id"]})
+                    return
+
+                if action == "lock":
+                    # A week, not a task: no id to look up.
+                    week_start = body.get("weekStart")
+                    if not week_start:
+                        self.send_json({"ok": False, "error": "No week"}, 400)
+                        return
+                    store.lock_week(week_start, actor="mq")
+                    self.send_json({"ok": True, "weekStart": week_start})
+                    return
+
+                task = wanted_task()
+                if task is None:
+                    self.send_json({"ok": False, "error": "No such task"}, 404)
+                    return
+
+                if action == "plan":
+                    day = body.get("day")
+                    if day:
+                        store.plan_task(task["id"], day, actor="mq")
+                    else:
+                        store.unplan_task(task["id"], actor="mq")
+                elif action == "done":
+                    store.complete_task(task["id"], actor="mq")
+                elif action == "reopen":
+                    store.reopen_task(
+                        task["id"], actor="mq",
+                        status="planned" if task["planned_day"] else "backlog")
+                elif action == "confirm":
+                    store.confirm_task(task["id"], actor="mq")
+                elif action == "dismiss":
+                    # A proposal MQ does not want. Cancelled, not deleted:
+                    # the row and its audit line stay.
+                    store.update_task(task["id"], actor="mq", status="canceled")
+                elif action == "load":
+                    store.update_task(task["id"], actor="mq",
+                                      load=body.get("load") or None)
+                else:
+                    self.send_json({"ok": False, "error": "Unknown action"}, 404)
+                    return
+                self.send_json({"ok": True, "id": task["id"]})
+            except mhstore.StoreError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
             return
 
         elif self.path == "/api/set-review":
@@ -2240,6 +2369,90 @@ body {
 }
 .priority-check:hover { background: var(--accent-dim); color: var(--accent); transform: scale(1.2); }
 .priority-text { flex: 1; min-width: 0; }
+.priority-item[draggable="true"] { cursor: grab; }
+.priority-item[draggable="true"]:active { cursor: grabbing; }
+.priority-day.drop-target {
+    outline: 1px dashed var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+    background: var(--accent-dim);
+}
+.week-locked {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    opacity: 0.55;
+    margin-left: 6px;
+}
+.priorities-actions { display: flex; gap: 6px; }
+.quick-add {
+    font-size: 10px;
+    opacity: 0.35;
+    padding: 2px 4px;
+    margin: 2px -4px 0;
+    cursor: pointer;
+    border-radius: 4px;
+}
+.quick-add:hover { opacity: 0.9; background: var(--accent-dim); }
+.quick-add-input {
+    width: 100%;
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 4px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+}
+
+/* Backlog / Proposed / Projects panels */
+.panels-bar { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 14px; }
+.panel {
+    flex: 1 1 240px;
+    min-width: 220px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 11px;
+}
+.panel[data-empty="1"] { opacity: 0.55; }
+.panel > summary {
+    cursor: pointer;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    list-style: none;
+}
+.panel > summary::-webkit-details-marker { display: none; }
+.panel-count { opacity: 0.5; font-weight: 400; margin-left: 4px; }
+.panel-body { margin-top: 6px; max-height: 260px; overflow-y: auto; }
+.panel-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 3px 4px;
+    margin: 0 -4px;
+    border-radius: 4px;
+    line-height: 1.35;
+    cursor: grab;
+}
+.panel-item:hover { background: var(--accent-dim); }
+.panel-item-text { flex: 1; min-width: 0; }
+.panel-item-key { flex-shrink: 0; opacity: 0.45; font-size: 9px; align-self: center; }
+.panel-next { opacity: 0.75; }
+.panel-btn {
+    flex-shrink: 0;
+    font: inherit;
+    font-size: 9px;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    text-decoration: none;
+}
+.panel-btn:hover { border-color: var(--accent); color: var(--accent); }
+.panel-empty { opacity: 0.45; padding: 3px 0; }
 .priority-load {
     flex-shrink: 0;
     font-size: 9px;
@@ -2816,6 +3029,7 @@ body {
 </div>
 
 <div id="prioritiesBar" class="priorities-bar"></div>
+<div id="panelsBar" class="panels-bar"></div>
 
 <div class="filter-bar">
     <span id="activeFilter"></span>
@@ -2855,6 +3069,7 @@ document.addEventListener('DOMContentLoaded', () => {
 let sessions = [];
 let colorGroups = {};
 let priorities = {};
+let panels = {available: false, backlog: [], proposed: [], projects: []};
 let activeFilterTag = null;
 let tagInputTarget = null;
 let isEditing = false;
@@ -2870,6 +3085,7 @@ async function fetchSessions(force = false) {
         sessions = data.sessions;
         colorGroups = data.colorGroups || {};
         priorities = data.priorities || {};
+        panels = data.panels || {available: false, backlog: [], proposed: [], projects: []};
         renderAll();
     } catch(e) {
         console.error('Fetch error:', e);
@@ -2962,6 +3178,7 @@ function getFilteredSessions() {
 
 function renderAll() {
     renderPriorities();
+    renderPanels();
     renderTagCloudInline();
     renderFilterBar();
     renderCards();
@@ -2981,29 +3198,162 @@ function renderPriorities() {
     if (!visibleWeeks.length) { container.innerHTML = ''; return; }
 
     const noCurrent = priorities.noCurrentWeek;
+    const live = priorities.source === 'store';
+
+    const renderItem = (item) => `<div class="priority-item ${item.done ? 'done' : ''}"
+        data-text="${escAttr(item.text)}"${item.id != null ? ` data-id="${item.id}"` : ''}
+        data-done="${item.done ? '1' : '0'}"
+        ${live && item.id != null ? 'draggable="true" ondragstart="dragTaskStart(event)"' : ''}
+        onclick="togglePriorityItemFromEl(this)" title="${escAttr(item.key || item.text)}">
+        <span class="priority-check">${item.done ? '✓' : '○'}</span>
+        <span class="priority-text">${escHtml(item.text)}</span>
+        ${item.load ? `<span class="priority-load">${escHtml(item.load)}</span>` : ''}
+    </div>`;
+
     const renderWeek = (w, showMapBtn, idx) => {
         let suffix = '';
         if (noCurrent && idx === 0) suffix = ' <span style="opacity:0.6">· upcoming (no plan for this week)</span>';
         else if (!w.isCurrent) suffix = ' <span style="opacity:0.6">· next week</span>';
+        if (w.locked) suffix += ' <span class="week-locked">locked</span>';
         return `<div class="priorities-week">
         <div class="priorities-header">
             <div class="priorities-title">${escHtml(w.title || (w.isCurrent ? 'This Week' : 'Next Week'))}${suffix}</div>
-            ${showMapBtn ? '<button class="map-btn" onclick="mapPriorities()">Map to sessions</button>' : ''}
+            <div class="priorities-actions">
+                ${live && w.weekStart && !w.locked ? `<button class="map-btn" onclick="lockWeek('${w.weekStart}')">Lock week</button>` : ''}
+                ${showMapBtn ? '<button class="map-btn" onclick="mapPriorities()">Map to sessions</button>' : ''}
+            </div>
         </div>
         <div class="priorities-days">
-            ${w.days.map(d => `<div class="priority-day">
+            ${w.days.map(d => `<div class="priority-day"
+                ${live && d.date ? `ondragover="dragOverDay(event)" ondragleave="dragLeaveDay(event)" ondrop="dropOnDay(event, '${d.date}')"` : ''}>
                 <div class="priority-day-name">${escHtml(d.day)}</div>
-                ${d.items.map(item => `<div class="priority-item ${item.done ? 'done' : ''}" data-text="${escAttr(item.text)}"${item.id != null ? ` data-id="${item.id}"` : ''} data-done="${item.done ? '1' : '0'}" onclick="togglePriorityItemFromEl(this)" title="${escAttr(item.key || item.text)}">
-                    <span class="priority-check">${item.done ? '✓' : '○'}</span>
-                    <span class="priority-text">${escHtml(item.text)}</span>
-                    ${item.load ? `<span class="priority-load">${escHtml(item.load)}</span>` : ''}
-                </div>`).join('')}
+                ${d.items.map(renderItem).join('')}
+                ${live && d.date ? `<div class="quick-add" onclick="startQuickAdd(this, '${d.date}')">+ add</div>` : ''}
             </div>`).join('')}
         </div>
     </div>`;
     };
 
     container.innerHTML = visibleWeeks.map((w, i) => renderWeek(w, i === 0, i)).join('');
+}
+
+// --- drag a task onto a different day ------------------------------------
+
+function dragTaskStart(ev) {
+    const id = ev.currentTarget.dataset.id;
+    if (!id) return;
+    ev.dataTransfer.setData('text/plain', id);
+    ev.dataTransfer.effectAllowed = 'move';
+}
+
+function dragOverDay(ev) {
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = 'move';
+    ev.currentTarget.classList.add('drop-target');
+}
+
+function dragLeaveDay(ev) {
+    ev.currentTarget.classList.remove('drop-target');
+}
+
+async function dropOnDay(ev, day) {
+    ev.preventDefault();
+    ev.currentTarget.classList.remove('drop-target');
+    const id = Number(ev.dataTransfer.getData('text/plain'));
+    if (!id) return;
+    await storeAction('task/plan', {id, day});
+    fetchSessions(true);
+}
+
+// --- quick add ------------------------------------------------------------
+
+function startQuickAdd(el, day) {
+    if (el.querySelector('input')) return;
+    el.innerHTML = '<input class="quick-add-input" placeholder="New task, Enter to save">';
+    const input = el.querySelector('input');
+    input.focus();
+    isEditing = true;
+    const finish = async (save) => {
+        const title = input.value.trim();
+        isEditing = false;
+        if (save && title) {
+            await storeAction('task/add', {title, plannedDay: day});
+            fetchSessions(true);
+        } else {
+            el.innerHTML = '+ add';
+        }
+    };
+    input.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    };
+    input.onblur = () => finish(false);
+}
+
+async function storeAction(action, payload) {
+    const res = await fetch('/api/' + action, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        console.warn('store action failed', action, err);
+    }
+    return res.ok;
+}
+
+async function lockWeek(weekStart) {
+    if (!confirm('Lock this week? Planned rows are committed.')) return;
+    await storeAction('plan/lock', {weekStart});
+    fetchSessions(true);
+}
+
+async function taskAction(action, id) {
+    await storeAction('task/' + action, {id});
+    fetchSessions(true);
+}
+
+function renderPanels() {
+    const container = document.getElementById('panelsBar');
+    if (!container) return;
+    if (!panels.available) { container.innerHTML = ''; return; }
+
+    const itemRow = (item, actions) => `<div class="panel-item" draggable="true"
+        data-id="${item.id}" ondragstart="dragTaskStart(event)"
+        title="${escAttr(item.key || item.text)}">
+        <span class="panel-item-text">${escHtml(item.text)}</span>
+        ${item.key ? `<span class="panel-item-key">${escHtml(item.key)}</span>` : ''}
+        ${actions}
+    </div>`;
+
+    const section = (title, body, count) => `<details class="panel" ${count ? '' : 'data-empty="1"'}>
+        <summary>${escHtml(title)} <span class="panel-count">${count}</span></summary>
+        <div class="panel-body">${body}</div>
+    </details>`;
+
+    const proposed = panels.proposed.map(i => itemRow(i,
+        `<button class="panel-btn" onclick="event.stopPropagation();taskAction('confirm',${i.id})">keep</button>
+         <button class="panel-btn" onclick="event.stopPropagation();taskAction('dismiss',${i.id})">drop</button>`
+    )).join('') || '<div class="panel-empty">Nothing waiting on you.</div>';
+
+    const backlog = panels.backlog.map(i => itemRow(i, '')).join('')
+        || '<div class="panel-empty">Backlog is clear.</div>';
+
+    const projects = panels.projects.map(p => `<div class="panel-item">
+        <span class="panel-item-text">
+            <strong>${escHtml(p.name)}</strong>
+            ${p.next ? `<br><span class="panel-next" draggable="true" data-id="${p.next.id}" ondragstart="dragTaskStart(event)">${escHtml(p.next.text)}</span>`
+                     : '<br><span class="panel-empty">no next action</span>'}
+        </span>
+        <span class="panel-item-key">${p.openCount} open${p.status !== 'active' ? ' · ' + escHtml(p.status) : ''}</span>
+        ${p.notePath ? `<a class="panel-btn" href="${p.notePath}" onclick="event.stopPropagation()">note</a>` : ''}
+    </div>`).join('') || '<div class="panel-empty">No active projects.</div>';
+
+    container.innerHTML =
+        section('Proposed', proposed, panels.proposed.length) +
+        section('Backlog', backlog, panels.backlog.length) +
+        section('Projects', projects, panels.projects.length);
 }
 
 function renderTagCloudInline() {
