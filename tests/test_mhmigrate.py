@@ -481,6 +481,41 @@ class TestPriorities(MigrationCase):
         self.assertEqual(one_offs[0]["planned_day"], "2026-08-24")
         self.assertEqual(len(report.priority_unmatched), 1)
 
+    def test_deferred_section_does_not_inherit_the_last_day(self):
+        """
+        A '### Not this week, deliberately' block sits after the last day
+        card. Without ending the day, its items are filed as that day's
+        commitments, which is the opposite of what the heading says.
+        """
+        (self.repo / "priorities.md").write_text(
+            PRIORITIES.replace(
+                "### Blocked or waiting",
+                "### Not this week, deliberately\n\n"
+                "- [ ] **Deliberately deferred** `p#3`\n\n"
+                "### Blocked or waiting"))
+        store, report = self.run_migration()
+        deferred = self._by_ord(store)["3"]
+        self.assertIsNone(deferred["planned_day"],
+                          "deferred work must not be scheduled")
+        self.assertEqual(deferred["status"], "backlog")
+        self.assertIn("Not this week, deliberately", report.deferred_sections)
+
+    def test_confirmed_week_is_locked(self):
+        store, report = self.run_migration()
+        self.assertEqual(report.week_state, "locked")
+        self.assertIsNotNone(store.week("2026-08-24")["locked_at"])
+
+    def test_proposed_week_is_not_locked(self):
+        (self.repo / "priorities.md").write_text(
+            PRIORITIES.replace("(confirmed by MQ)",
+                               "(proposed by Orca 8/24, not confirmed)"))
+        store, report = self.run_migration()
+        self.assertEqual(report.week_state, "proposed")
+        week = store.week("2026-08-24")
+        self.assertIsNotNone(week["proposed_at"])
+        self.assertIsNone(week["locked_at"],
+                          "a proposal is not a commitment")
+
     def test_week_row_created(self):
         store, _ = self.run_migration()
         self.assertIsNotNone(store.week("2026-08-24"))

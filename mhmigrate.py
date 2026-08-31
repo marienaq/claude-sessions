@@ -18,6 +18,7 @@ import csv
 import hashlib
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import mhstore
@@ -66,6 +67,10 @@ MONTHS = {m.lower(): i for i, m in enumerate(
      "August", "September", "October", "November", "December"], start=1)}
 
 
+def _now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
 def split_cells(line):
     parts = line.split("|")
     if parts and parts[0].strip() == "":
@@ -98,6 +103,8 @@ class Report:
         self.priority_one_offs = 0
         self.priority_unmatched = []  # (title, when, why)
         self.priority_multi_day = []  # (tag, kept_day, also_day, title)
+        self.week_state = None
+        self.deferred_sections = []
 
     def add_ambiguous(self, key, title, raw, decided):
         self.ambiguous.append((key, title, raw, decided))
@@ -451,9 +458,12 @@ def print_report(report, dry_run):
           f"  ({report.note_chars:,} chars of prose moved out of table cells)")
     print(f"  decisions files {report.decisions_written}")
     if report.week:
-        print(f"  week            {report.week}  ({report.week_days} day cards, "
+        state = f", {report.week_state}" if report.week_state else ""
+        print(f"  week            {report.week}{state}  ({report.week_days} day cards, "
               f"{report.priority_matched} lines matched a task, "
               f"{report.priority_one_offs} became one-offs)")
+        for name in report.deferred_sections:
+            print(f"                  not scheduled: \"{name}\" -> backlog")
 
     def section(title, items, render):
         if not items:
@@ -516,7 +526,7 @@ def parse_priorities_file(repo):
     except StopIteration:
         return None
 
-    week_label, week_start = None, None
+    week_label, week_start, header_line = None, None, ""
     for line in reversed(lines[:goals_at]):
         m = WEEK_HEADER.match(line)
         if not m:
@@ -526,11 +536,15 @@ def parse_priorities_file(repo):
         if dm and dm.group(1).lower() in MONTHS:
             from datetime import date as _date
             week_label = label
+            # The proposed/confirmed marker sits after the closing **, so
+            # state has to be read from the whole line, not the label.
+            header_line = line
             week_start = _date(int(dm.group(3)), MONTHS[dm.group(1).lower()],
                                int(dm.group(2))).isoformat()
             break
 
-    days, blocked, backlog = [], [], []
+    days, blocked, backlog, deferred = [], [], [], []
+    deferred_sections = []
     current_day, bucket = None, None
     for line in lines[goals_at + 1:]:
         day = DAY_CARD.match(line)
@@ -550,6 +564,14 @@ def parse_priorities_file(repo):
             continue
         if BACKLOG_HEADER.match(line):
             bucket, current_day = "backlog", None
+            continue
+        if line.startswith("### "):
+            # A sub-heading that is not a day card ends the current day.
+            # Without this, a section like "Not this week, deliberately"
+            # inherits the previous day and its items are scheduled as that
+            # day's work, which is the opposite of what it says.
+            deferred_sections.append(line[4:].strip())
+            bucket, current_day = "deferred", None
             continue
         if line.startswith("## ") and not BACKLOG_HEADER.match(line):
             bucket, current_day = None, None
@@ -575,9 +597,18 @@ def parse_priorities_file(repo):
             blocked.append(item)
         elif bucket == "backlog":
             backlog.append(item)
+        elif bucket == "deferred":
+            deferred.append(item)
 
-    return {"label": week_label, "week_start": week_start,
-            "days": days, "blocked": blocked, "backlog": backlog}
+    # "(proposed by Orca ...)" vs "(confirmed by MQ ...)" in the week header
+    # is the difference between a proposal waiting on MQ and a locked week.
+    label_l = (header_line or week_label or "").lower()
+    state = "proposed" if "propos" in label_l else (
+        "locked" if ("confirm" in label_l or "locked" in label_l) else None)
+
+    return {"label": week_label, "week_start": week_start, "state": state,
+            "days": days, "blocked": blocked, "backlog": backlog,
+            "deferred": deferred, "deferred_sections": deferred_sections}
 
 
 def migrate_priorities(repo, store, report, dry_run=False):
@@ -652,12 +683,22 @@ def migrate_priorities(repo, store, report, dry_run=False):
         place(item, None, "waiting")
     for item in week["backlog"]:
         place(item, None, "backlog")
+    # Explicitly deferred: real work, but not this week's commitment.
+    for item in week["deferred"]:
+        place(item, None, "backlog")
 
     if not dry_run and week["week_start"]:
+        stamp = {}
+        if week["state"] == "proposed":
+            stamp["proposed_at"] = _now_iso()
+        elif week["state"] == "locked":
+            stamp["locked_at"] = _now_iso()
         store.upsert_week(week["week_start"], actor="migration",
-                          notes=week["label"])
+                          notes=week["label"], **stamp)
     report.week = week["week_start"]
     report.week_days = len(week["days"])
+    report.week_state = week["state"]
+    report.deferred_sections = week["deferred_sections"]
     return week
 
 
