@@ -241,6 +241,17 @@ def project_for_cwd(cwd):
         target = Path(cwd).resolve()
     except OSError:
         return None
+
+    # A dev instance runs against a copy of the repo while the sessions
+    # themselves are still working in the real one, so no cwd would ever match
+    # a project directory. CSM_CWD_ALIAS="<live>:<copy>" rewrites the prefix so
+    # the panel can be exercised before cutover. Unset in production.
+    alias = os.environ.get("CSM_CWD_ALIAS", "")
+    if ":" in alias:
+        src, _, dst = alias.partition(":")
+        src, dst = src.rstrip("/"), dst.rstrip("/")
+        if str(target) == src or str(target).startswith(src + os.sep):
+            target = Path(dst + str(target)[len(src):])
     best, best_len = None, -1
     for project in store.projects():
         if not project["dir"]:
@@ -1496,6 +1507,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
         elif self.path == "/api/task-files":
             files = []
+            # Sessions almost always run at the repo root rather than inside a
+            # project, so linking is how a session gets a project, not
+            # discovery. Offer the store's registered projects first: they
+            # carry status and open counts, and rglob over ~/Projects returns
+            # archived and unregistered lists indiscriminately.
+            store = get_store()
+            if store is not None and store_is_live():
+                for project in store.projects():
+                    if project["key"] == mhstore.ONE_OFF:
+                        continue
+                    if project["status"] in mhstore.ARCHIVED_PROJECT_STATUSES:
+                        continue
+                    open_count = len(store.tasks(project_key=project["key"],
+                                                 open_only=True))
+                    path = (MELLONHEAD_ROOT / project["dir"] / "task-list.md"
+                            if project["dir"] else MELLONHEAD_ROOT)
+                    files.append({
+                        "path": str(path),
+                        "shortPath": f"{project['key']}  ({open_count} open)",
+                        "projectName": project["name"],
+                        "projectKey": project["key"],
+                        "status": project["status"],
+                    })
+                files.sort(key=lambda f: (f["status"] != "active", f["projectKey"]))
+                self.send_json(files)
+                return
+
             projects = Path.home() / "Projects"
             if projects.exists():
                 for tf in projects.rglob("task-list.md"):

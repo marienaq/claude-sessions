@@ -26,6 +26,10 @@ if [ "$PORT" = "7433" ]; then
     exit 1
 fi
 
+# Sessions work in the real repo; the store here is built from a copy. Map the
+# prefix so project lookup resolves and the task panel can be tested.
+export CSM_CWD_ALIAS="${CSM_CWD_ALIAS:-$HOME/Projects/mellonhead:$MELLONHEAD_ROOT}"
+
 mkdir -p "$CSM_STATE_DIR"
 cd "$(dirname "$0")"
 exec /opt/homebrew/bin/python3 server.py --port "$PORT"
