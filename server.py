@@ -275,7 +275,7 @@ def task_list_from_store(project_key):
             "status": row["status"],
             "statusRaw": row["status_raw"] or row["status"],
             "notionTaskId": row["notion_task_id"] or "",
-            "notes": "",
+            "notes": row["notes"] or "",
             "notePath": row["note_path"],
             "owner": row["owner"],
             "seq": row["seq"],

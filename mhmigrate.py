@@ -392,6 +392,10 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
             # ken-yarmosh's narrative section for this row. Decided in both
             # modes so a dry run reports what it would write.
             notes = row.get("notes", "").strip()
+            if notes and len(notes) <= note_threshold:
+                # Short enough to render inline. Previously this was dropped:
+                # only cells past the threshold were kept, in a note file.
+                store.update_task(task["id"], actor="migration", notes=notes)
             narrative = narratives.get(str(row.get("#", "")).strip())
             body_parts = []
             if notes and len(notes) > note_threshold:
@@ -499,12 +503,42 @@ def print_report(report, dry_run):
     print()
 
 
-def strip_item_text(raw):
-    """A day-card line down to its title: no key tag, load tag, or done note."""
+FIRST_BOLD = re.compile(r"^\s*\*\*(.+?)\*\*\s*(.*)$", re.S)
+
+
+def split_item_text(raw):
+    """
+    A day-card line -> (title, body).
+
+    The convention is "**Title** [Load]. evidence trail", and the sweeps
+    write the trail inline: 29 lines in the real file run past 400
+    characters and the longest is 3,494. The bold span is the title. The
+    rest is history and belongs in a note file, not in a title column.
+    """
     text = KEY_TAG.sub("", raw)
     text = DONE_SUFFIX.sub("", text)
-    text = re.sub(r"\[(deep|medium|shallow)[^\]]*\]", "", text, flags=re.I)
-    return clean_title(text).strip(" .")
+
+    match = FIRST_BOLD.match(text)
+    if match:
+        title, body = match.group(1), match.group(2)
+    else:
+        # No bold span: fall back to the first sentence, keeping decimals,
+        # times and file extensions intact.
+        parts = re.split(r"(?<=[.!?])\s+(?=[A-Z*(])", text.strip(), maxsplit=1)
+        title = parts[0]
+        body = parts[1] if len(parts) > 1 else ""
+
+    # The load tag sits between the title and the prose and is captured
+    # separately, so it belongs in neither.
+    body = re.sub(r"^\s*\[(deep|medium|shallow)[^\]]*\]\s*[.:]?\s*", "",
+                  body, flags=re.I)
+    title = re.sub(r"\[(deep|medium|shallow)[^\]]*\]", "", title, flags=re.I)
+    return clean_title(title).strip(" .:"), body.strip()
+
+
+def strip_item_text(raw):
+    """A day-card line down to its title: no key tag, load tag, or done note."""
+    return split_item_text(raw)[0]
 
 
 def parse_priorities_file(repo):
@@ -581,9 +615,11 @@ def parse_priorities_file(repo):
             continue
         tag = KEY_TAG.search(box.group(2))
         load = LOAD_TAG.search(box.group(2))
+        parsed_title, parsed_body = split_item_text(box.group(2))
         item = {
             "raw": box.group(2).strip(),
-            "title": strip_item_text(box.group(2)),
+            "title": parsed_title,
+            "body": parsed_body,
             "done": box.group(1).lower() == "x",
             "key": tag.group(1) if tag else None,
             "ord": tag.group(2) if tag else None,
@@ -650,18 +686,29 @@ def migrate_priorities(repo, store, report, dry_run=False):
                 (item["title"][:56], planned_day or status_hint,
                  "tagged, no such row" if item["key"] else "untagged"))
             if dry_run:
+                if len(item.get("body") or "") > NOTE_THRESHOLD:
+                    report.notes_written += 1
+                    report.note_chars += len(item["body"])
                 return
+            body = (item.get("body") or "").strip()
             row = store.add_task(
                 mhstore.ONE_OFF, item["title"], actor="migration",
                 source="migration",
                 status="done" if item["done"] else status_hint,
                 planned_day=planned_day, load=item["load"],
+                notes=body if 0 < len(body) <= NOTE_THRESHOLD else None,
                 done_at=None)
             report.priority_one_offs += 1
+            _stash_body(repo, store, report, row["id"], item, "one-off")
             return
         report.priority_matched += 1
         if dry_run:
             return
+        body = (item.get("body") or "").strip()
+        if 0 < len(body) <= NOTE_THRESHOLD and not store.task(target)["notes"]:
+            store.update_task(target, actor="migration", notes=body)
+        _stash_body(repo, store, report, target, item,
+                    store.task(target)["project_key"])
         # Only ever set a day, never clear one. Blocked and backlog entries
         # carry no day and must not evict a task from the week.
         fields = {"planned_day": planned_day} if planned_day else {}
@@ -700,6 +747,41 @@ def migrate_priorities(repo, store, report, dry_run=False):
     report.week_state = week["state"]
     report.deferred_sections = week["deferred_sections"]
     return week
+
+
+def _stash_body(repo, store, report, task_id, item, project_key):
+    """
+    Put a day-card line's evidence trail in a note file.
+
+    Sweeps write the whole history inline, so without this the prose either
+    becomes a 3,000-character title or is dropped on the floor. Appends
+    rather than overwrites, and only when this exact text is not already
+    there, so a re-run does not grow the file.
+    """
+    body = (item.get("body") or "").strip()
+    if len(body) <= NOTE_THRESHOLD:
+        return
+    task = store.task(task_id)
+    project = store.project(project_key) or {}
+    project_dir = project.get("dir") or "operations/one-off"
+    rel = task["note_path"] or str(
+        Path(project_dir) / "task-notes" / f"{task_id}-{slugify(task['title'])}.md")
+    target = repo / rel
+    existing = target.read_text() if target.exists() else ""
+    if body[:120] in existing:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not existing:
+        existing = (f"# {task['title']}\n\n**Task:** `{task_id}`\n\n"
+                    f"<!-- Created by migration from the weekly plan. "
+                    f"Hand-written from here on. -->\n\n## History\n")
+    with open(target, "w") as f:
+        f.write(existing.rstrip("\n") + "\n\n### From the weekly plan\n\n"
+                + body + "\n")
+    if not task["note_path"]:
+        store.update_task(task_id, actor="migration", note_path=rel)
+    report.notes_written += 1
+    report.note_chars += len(body)
 
 
 def verify(repo, store, note_threshold=NOTE_THRESHOLD):

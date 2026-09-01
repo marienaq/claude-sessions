@@ -477,7 +477,9 @@ class TestPriorities(MigrationCase):
         store, report = self.run_migration()
         one_offs = store.tasks(project_key=mhstore.ONE_OFF)
         self.assertEqual(len(one_offs), 1)
-        self.assertEqual(one_offs[0]["title"], "No tag at all, just a line")
+        self.assertEqual(one_offs[0]["title"], "No tag at all")
+        self.assertEqual(one_offs[0]["notes"], ", just a line.",
+                         "the clause after the title must not be dropped")
         self.assertEqual(one_offs[0]["planned_day"], "2026-08-24")
         self.assertEqual(len(report.priority_unmatched), 1)
 
@@ -515,6 +517,70 @@ class TestPriorities(MigrationCase):
         self.assertIsNotNone(week["proposed_at"])
         self.assertIsNone(week["locked_at"],
                           "a proposal is not a commitment")
+
+    def test_long_line_splits_into_title_and_note(self):
+        """
+        Sweeps write the whole evidence trail into the day-card line. Without
+        splitting on the bold span the trail becomes the title: the real file
+        had 17 rows over 200 characters and one at 3,494.
+        """
+        trail = ("Anushka emailed at 11:50pm PT Sun 8/30 to Sharla and both "
+                 "addresses, and the review gates the 9/4 delivery. " * 4)
+        (self.repo / "priorities.md").write_text(
+            "**Week of August 24, 2026** (confirmed by MQ)\n\n"
+            "## Weekly Goals\n\n"
+            "### Monday 8/24\n\n"
+            f"- [ ] **Review the Rise course draft** [Deep]. {trail} `p#1`\n")
+        store, report = self.run_migration()
+
+        # A tagged line matches a task-list row, and the list stays
+        # authoritative for the title. What the line contributes is the load
+        # tag and the evidence trail.
+        task = self._by_ord(store)["1"]
+        self.assertLess(len(task["title"]), 60)
+        self.assertEqual(task["load"], "deep")
+        self.assertIsNotNone(task["note_path"], "the trail needs somewhere to live")
+        body = (self.repo / task["note_path"]).read_text()
+        self.assertIn("Anushka emailed at 11:50pm PT", body)
+        self.assertIn("From the weekly plan", body)
+
+    def test_untagged_long_line_also_splits(self):
+        trail = "Context that runs on and on and needs a home. " * 8
+        (self.repo / "priorities.md").write_text(
+            "**Week of August 24, 2026** (confirmed by MQ)\n\n"
+            "## Weekly Goals\n\n### Monday 8/24\n\n"
+            f"- [ ] **A one-off with history** [Shallow]. {trail}\n")
+        store, _ = self.run_migration()
+        one_off = store.tasks(project_key=mhstore.ONE_OFF)[0]
+        self.assertEqual(one_off["title"], "A one-off with history")
+        self.assertIsNotNone(one_off["note_path"])
+
+    def test_short_line_gets_no_note_file(self):
+        (self.repo / "priorities.md").write_text(
+            "**Week of August 24, 2026** (confirmed by MQ)\n\n"
+            "## Weekly Goals\n\n### Monday 8/24\n\n"
+            "- [ ] **Short and complete** [Shallow]. One clause. `p#1`\n")
+        store, _ = self.run_migration()
+        task = self._by_ord(store)["1"]
+        self.assertEqual(task["notes"], "One clause.",
+                         "the clause after the title becomes inline notes")
+        self.assertIsNone(task["note_path"], "no note file for a one-liner")
+
+    def test_rerun_does_not_duplicate_note_body(self):
+        trail = "The same trail repeated on every migration run. " * 8
+        (self.repo / "priorities.md").write_text(
+            "**Week of August 24, 2026** (confirmed by MQ)\n\n"
+            "## Weekly Goals\n\n### Monday 8/24\n\n"
+            f"- [ ] **Repeated line** [Deep]. {trail} `p#1`\n")
+        self.write_registry()
+        store = mhstore.open_store(root=self.repo)
+        self._stores.append(store)
+        mhmigrate.migrate(self.repo, store)
+        path = self.repo / store.tasks(project_key="p")[0]["note_path"]
+        first = path.read_text()
+        mhmigrate.migrate(self.repo, store)
+        self.assertEqual(path.read_text(), first,
+                         "re-running must not append the trail twice")
 
     def test_week_row_created(self):
         store, _ = self.run_migration()

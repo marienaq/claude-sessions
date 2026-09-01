@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     planned_day    TEXT,
     depends_on     INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
     waiting_on     TEXT,
+    -- One sentence of context, rendered inline in the generated views.
+    -- Anything longer than this lives in note_path. Without both, a short
+    -- Notes cell or a short trailing clause had nowhere to go and was lost.
+    notes          TEXT,
     note_path      TEXT,
     brief_path     TEXT,
     notion_task_id TEXT,
@@ -562,6 +566,7 @@ class Store:
             "planned_day": fields.get("planned_day"),
             "depends_on": fields.get("depends_on"),
             "waiting_on": fields.get("waiting_on"),
+            "notes": fields.get("notes"),
             "note_path": fields.get("note_path"),
             "brief_path": fields.get("brief_path"),
             "notion_task_id": fields.get("notion_task_id"),
@@ -587,7 +592,7 @@ class Store:
         allowed = {
             "title", "status", "status_raw", "owner", "seq", "is_next",
             "section", "display_ord", "load", "due", "planned_day",
-            "depends_on", "waiting_on", "note_path", "brief_path",
+            "depends_on", "waiting_on", "notes", "note_path", "brief_path",
             "notion_task_id", "source", "confirmed", "done_at",
         }
         bad = set(fields) - allowed
@@ -767,6 +772,9 @@ def open_store(root=None, db_path=None, seed_settings=True):
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    if "notes" not in have:
+        conn.execute("ALTER TABLE tasks ADD COLUMN notes TEXT")
 
     store = Store(conn, root)
     if seed_settings:
