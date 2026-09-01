@@ -24,8 +24,10 @@ Workstream 2.1 (generators). Stdlib only.
 """
 
 import argparse
+import os
 import re
 import sys
+import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -61,6 +63,22 @@ STATUS_TEXT = {
 }
 
 OWNER_TEXT = {"mq": "MQ"}
+
+
+def atomic_write(path, text):
+    """Unique temp name: two generators must not clobber each other's."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def stamp(what):
@@ -188,9 +206,7 @@ def generate_task_list(store, repo, project_key, dry_run=False):
     text = "\n".join(out).rstrip("\n") + "\n"
     if dry_run:
         return text
-    tmp = path.with_suffix(".md.tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
+    atomic_write(path, text)
     return text
 
 
@@ -315,9 +331,7 @@ def generate_priorities(store, repo, week_start=None, dry_run=False):
     text = text.lstrip("\n").rstrip("\n") + "\n"
     if dry_run:
         return text
-    tmp = path.with_suffix(".md.tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
+    atomic_write(path, text)
     return text
 
 
@@ -375,10 +389,7 @@ def generate_dashboard(store, repo, dry_run=False):
         return md_text
     for target, body in ((repo / "operations" / "projects-dashboard.md", md_text),
                          (repo / "operations" / "projects-dashboard.json", json_text)):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(body)
-        tmp.replace(target)
+        atomic_write(target, body)
     return md_text
 
 

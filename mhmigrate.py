@@ -73,6 +73,21 @@ def _now_iso():
 
 CELL_SPLIT = re.compile(r"(?<!\\)\|")
 
+# The generator renders a task's note file as "[note](79-slug.md)" in the
+# Notes cell and as "Notes: `path`." on a day-card line. Reading either back
+# as prose and then re-rendering it appends a second copy, so each cycle grows
+# the cell: [note](x) [note](x) [note](x). Counts stay stable while the text
+# quietly doubles, which is why a row-count convergence check did not catch it.
+GENERATED_NOTE_LINK = re.compile(r"\s*\[note\]\([^)]*\)")
+GENERATED_NOTE_PATH = re.compile(r"\s*Notes:\s*`[^`]*`\.?")
+
+
+def strip_generated_markers(text):
+    """Remove what the generator adds, so a round trip does not accumulate."""
+    text = GENERATED_NOTE_LINK.sub("", text or "")
+    text = GENERATED_NOTE_PATH.sub("", text)
+    return text.strip()
+
 
 def split_cells(line):
     """
@@ -416,7 +431,7 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
             # Prose that does not belong in a column: the Notes cell, plus
             # ken-yarmosh's narrative section for this row. Decided in both
             # modes so a dry run reports what it would write.
-            notes = row.get("notes", "").strip()
+            notes = strip_generated_markers(row.get("notes", ""))
             if notes and len(notes) <= note_threshold:
                 # Short enough to render inline. Previously this was dropped:
                 # only cells past the threshold were kept, in a note file.
@@ -557,6 +572,7 @@ def split_item_text(raw):
     # separately, so it belongs in neither.
     body = re.sub(r"^\s*\[(deep|medium|shallow)[^\]]*\]\s*[.:]?\s*", "",
                   body, flags=re.I)
+    body = strip_generated_markers(body)
     title = re.sub(r"\[(deep|medium|shallow)[^\]]*\]", "", title, flags=re.I)
     return clean_title(title).strip(" .:"), body.strip()
 
@@ -771,10 +787,14 @@ def migrate_priorities(repo, store, report, dry_run=False):
         place(item, None, "backlog")
 
     if not dry_run and week["week_start"]:
+        # Stamp only the first time. Re-stamping on every run walks the lock
+        # date forward, so a week locked last Friday would keep claiming it
+        # was locked today.
+        current = store.week(week["week_start"]) or {}
         stamp = {}
-        if week["state"] == "proposed":
+        if week["state"] == "proposed" and not current.get("proposed_at"):
             stamp["proposed_at"] = _now_iso()
-        elif week["state"] == "locked":
+        elif week["state"] == "locked" and not current.get("locked_at"):
             stamp["locked_at"] = _now_iso()
         store.upsert_week(week["week_start"], actor="migration",
                           notes=week["label"], **stamp)

@@ -726,14 +726,33 @@ class Store:
         }
 
     def write_snapshot(self):
-        """Atomic: temp file then replace, so a reader never sees half a dump."""
+        """
+        Atomic: temp file then replace, so a reader never sees half a dump.
+
+        The temp file needs a unique name. With a fixed one, two writers race:
+        both create it, the first renames it away, and the second's rename
+        raises FileNotFoundError after its database commit has already
+        succeeded. The caller then sees a failure for a write that landed.
+        Four concurrent writers lost 10% of their calls that way.
+        """
+        import os
+        import tempfile
+
         path = self.snapshot_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w") as f:
-            json.dump(self.snapshot(), f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        tmp.replace(path)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".tasks-", suffix=".json.tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.snapshot(), f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         return path
 
     def close(self):

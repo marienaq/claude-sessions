@@ -304,6 +304,45 @@ class TestRoundTrip(GenCase):
         self.assertEqual(counts[0], counts[1], "second cycle must not add rows")
         self.assertEqual(counts[1], counts[2], "third cycle must not add rows")
 
+    def test_file_content_converges_not_just_row_counts(self):
+        """
+        The counts held at 224 for three cycles while the Notes cell grew
+        every time: the generator writes "[note](x.md)", migration read it
+        back as prose, and the next generation appended a second copy. A
+        convergence check on row counts cannot see that. Compare the bytes.
+        """
+        monday = date.today() - timedelta(days=date.today().weekday())
+        make_list(self.repo / "proj" / "task-list.md", "proj",
+                  [{"n": 1, "task": "placeholder"}])
+        self.write_registry()
+        self.store.add_task("proj", "Has a note", display_ord="1", seq=10,
+                            section="Tasks", notes="A short sentence.",
+                            note_path="proj/task-notes/1-has-a-note.md",
+                            planned_day=monday.isoformat(), status="planned")
+        (self.repo / "proj" / "task-notes").mkdir(parents=True)
+        (self.repo / "proj" / "task-notes" / "1-has-a-note.md").write_text(
+            "# Has a note\n\n## History\n\nSomething long.\n")
+        self.store.upsert_week(monday.isoformat(), locked_at="2026-08-31T10:00:00")
+        (self.repo / "priorities.md").write_text("# P\n\n## Weekly Goals\n")
+
+        strip = lambda t: "\n".join(l for l in t.splitlines()
+                                    if not l.startswith("<!-- GENERATED"))
+        seen = []
+        for _ in range(3):
+            mhgen.generate_all(self.store, self.repo)
+            mhmigrate.migrate(self.repo, self.store)
+            seen.append((
+                strip((self.repo / "proj" / "task-list.md").read_text()),
+                strip((self.repo / "priorities.md").read_text()),
+            ))
+        self.assertEqual(seen[0], seen[1], "second cycle changed the files")
+        self.assertEqual(seen[1], seen[2], "third cycle changed the files")
+
+        row = next(l for l in seen[-1][0].splitlines() if "Has a note" in l)
+        self.assertEqual(row.count("[note]"), 1, "one link, not a growing list")
+        day = next(l for l in seen[-1][1].splitlines() if "Has a note" in l)
+        self.assertEqual(day.count("Notes:"), 1)
+
     def test_ids_are_stable_across_migrations(self):
         """Note files are named <id>-<slug>.md, so a changed id orphans one."""
         make_list(self.repo / "proj" / "task-list.md", "proj",
