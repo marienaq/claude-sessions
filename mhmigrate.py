@@ -869,27 +869,32 @@ def verify(repo, store, note_threshold=NOTE_THRESHOLD):
             if not stored:
                 problems.append(f"{key}: no store row for {title[:48]!r}")
                 continue
-            notes = row.get("notes", "").strip()
-            if len(notes) <= note_threshold:
+            # The invariant is that the prose survives somewhere, not that it
+            # lives in a particular place. A cell can legitimately be split:
+            # a sentence in the notes column plus a link to the longer trail
+            # in the note file. Strip what the generator adds before looking.
+            notes = strip_generated_markers(row.get("notes", ""))
+            if not notes:
                 continue
-            note_path = stored[0].get("note_path")
+            task = stored[0]
+            probe = notes[:120].strip()
+            if probe and probe in (task.get("notes") or ""):
+                continue
+            note_path = task.get("note_path")
             if not note_path:
-                problems.append(
-                    f"{key}: {len(notes)} chars of notes on {title[:40]!r} "
-                    f"but no note file")
+                if len(notes) > note_threshold:
+                    problems.append(
+                        f"{key}: {len(notes)} chars of notes on {title[:40]!r} "
+                        f"are in neither the notes column nor a note file")
                 continue
             target = repo / note_path
             if not target.exists():
                 problems.append(f"{key}: note file missing at {note_path}")
                 continue
-            body = target.read_text()
-            # Compare on a distinctive slice; whitespace differs after the
-            # markdown cell is unwrapped.
-            probe = notes[:120].strip()
-            if probe and probe not in body:
+            if probe and probe not in target.read_text():
                 problems.append(
-                    f"{key}: note file for {title[:40]!r} does not contain "
-                    f"the original Notes text")
+                    f"{key}: prose on {title[:40]!r} is in neither the notes "
+                    f"column nor {note_path}")
     return problems
 
 
@@ -917,7 +922,7 @@ def main(argv=None):
                     print(f"  {p}")
                 return 1
             print("\nverified: every task row is in the store and every "
-                  "substantial Notes cell is in a note file\n")
+                  "Notes cell survives in the notes column or a note file\n")
             return 0
         report = migrate(repo, store, dry_run=args.dry_run,
                          note_threshold=args.note_threshold)
