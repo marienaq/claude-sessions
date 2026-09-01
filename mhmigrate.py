@@ -71,13 +71,24 @@ def _now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
 
+CELL_SPLIT = re.compile(r"(?<!\\)\|")
+
+
 def split_cells(line):
-    parts = line.split("|")
+    """
+    Split a table row on unescaped pipes.
+
+    A cell may legitimately contain "\\|" (a task titled "Compare A | B"),
+    and the generator writes it that way. Splitting on every pipe turns one
+    such row into a cell-count mismatch, which this code then reports as
+    malformed and drops. Round-tripping a pipe has to be lossless.
+    """
+    parts = CELL_SPLIT.split(line)
     if parts and parts[0].strip() == "":
         parts = parts[1:]
     if parts and parts[-1].strip() == "":
         parts = parts[:-1]
-    return [p.strip() for p in parts]
+    return [p.strip().replace("\\|", "|") for p in parts]
 
 
 class Report:
@@ -293,12 +304,17 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
     report = Report()
     registry = read_registry(repo)
 
-    # Wipe prior migration rows so a re-run does not duplicate.
-    if not dry_run:
-        store.conn.execute("DELETE FROM tasks WHERE source = 'migration'")
-        store.conn.execute(
-            "DELETE FROM projects WHERE key != ? AND key IN "
-            "(SELECT key FROM projects)", (mhstore.ONE_OFF,))
+    # Match existing rows instead of deleting and re-inserting them. Ids have
+    # to be stable: note files are named <id>-<slug>.md, so recreating rows
+    # renames every note file's target and orphans it. Matching also stops a
+    # task MQ added in the UI from being duplicated once the generator has
+    # written it into the markdown that migration then reads back.
+    existing = {}
+    for row in store.tasks():
+        ident = (row["project_key"],
+                 str(row["display_ord"]) if row["display_ord"] else row["title"])
+        existing[ident] = row["id"]
+    seen_ids = set()
 
     seen_hashes = {}
     id_map = []
@@ -323,10 +339,7 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
         project_dir = str(Path(meta["path"]).parent)
 
         if not dry_run:
-            store.add_project(
-                key,
-                header.get("name") or meta["name"],
-                actor="migration",
+            fields = dict(
                 dir=project_dir,
                 status=normalize_project_status(header.get("status")),
                 owner=normalize_owner(header.get("owner")),
@@ -335,6 +348,11 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
                 notion_project_id=clean(header.get("notion_project_id")),
                 goal=parse_goal(lines),
             )
+            name = header.get("name") or meta["name"]
+            if store.project(key):
+                store.update_project(key, actor="migration", name=name, **fields)
+            else:
+                store.add_project(key, name, actor="migration", **fields)
         report.projects += 1
 
         decisions = parse_section(lines, KEY_DECISIONS)
@@ -372,8 +390,7 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
 
             task = None
             if not dry_run:
-                task = store.add_task(
-                    key, title, actor="migration", source="migration",
+                fields = dict(
                     status=status, status_raw=kept, done_at=done_at,
                     owner=normalize_owner(row.get("owner")),
                     seq=seq, is_next=1 if has_next_marker(raw_title) else 0,
@@ -382,6 +399,14 @@ def migrate(repo, store, dry_run=False, note_threshold=NOTE_THRESHOLD):
                     due=due,
                     notion_task_id=clean(row.get("notion task id")),
                 )
+                ident = (key, clean(row.get("#")) or title)
+                if ident in existing:
+                    task = store.update_task(existing[ident], actor="migration",
+                                             title=title, **fields)
+                else:
+                    task = store.add_task(key, title, actor="migration",
+                                          source="migration", **fields)
+                seen_ids.add(task["id"])
                 id_map.append({
                     "project": key, "old_row": row.get("#", ""),
                     "new_id": task["id"], "title": title,
@@ -661,9 +686,15 @@ def migrate_priorities(repo, store, report, dry_run=False):
         return None
 
     by_tag = {}
+    # One-offs have no key#N to match on, so they are matched by title. Without
+    # this the priorities pass re-creates all of them on every run: 17 rows a
+    # time, growing without bound.
+    by_title = {}
     for task in store.tasks():
         if task["display_ord"]:
             by_tag[(task["project_key"], str(task["display_ord"]))] = task["id"]
+        if task["project_key"] == mhstore.ONE_OFF:
+            by_title[task["title"]] = task["id"]
 
     scheduled = {}   # task id -> the first day it was seen on
 
@@ -691,13 +722,18 @@ def migrate_priorities(repo, store, report, dry_run=False):
                     report.note_chars += len(item["body"])
                 return
             body = (item.get("body") or "").strip()
-            row = store.add_task(
-                mhstore.ONE_OFF, item["title"], actor="migration",
-                source="migration",
+            common = dict(
                 status="done" if item["done"] else status_hint,
                 planned_day=planned_day, load=item["load"],
-                notes=body if 0 < len(body) <= NOTE_THRESHOLD else None,
-                done_at=None)
+                notes=body if 0 < len(body) <= NOTE_THRESHOLD else None)
+            if item["title"] in by_title:
+                row = store.update_task(by_title[item["title"]],
+                                        actor="migration", **common)
+            else:
+                row = store.add_task(
+                    mhstore.ONE_OFF, item["title"], actor="migration",
+                    source="migration", done_at=None, **common)
+                by_title[item["title"]] = row["id"]
             report.priority_one_offs += 1
             _stash_body(repo, store, report, row["id"], item, "one-off")
             return
