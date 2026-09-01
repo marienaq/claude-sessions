@@ -62,19 +62,42 @@ STATE_CATEGORIES = (
 # ---------------------------------------------------------------------------
 
 _STORE = None
+_STORE_FILE_ID = None
 
 
 def get_store():
-    """Open the store once per process. None if it is unavailable."""
-    global _STORE
+    """
+    Open the store once per process, and reopen it if the file underneath has
+    been replaced.
+
+    A long-lived handle keeps writing to the old inode after tasks.db is
+    swapped out — by a restore, a migration that recreates it, or a rebuilt
+    working copy. SQLite reports success, the audit log records the write
+    because it reopens by path, and the row never changes. Three checkbox
+    clicks were lost that way, with an audit trail saying they happened.
+    """
+    global _STORE, _STORE_FILE_ID
     if mhstore is None:
         return None
+    try:
+        info = STORE_FILE.stat()
+        file_id = (info.st_dev, info.st_ino)
+    except OSError:
+        return None
+
+    if _STORE is not None and _STORE_FILE_ID != file_id:
+        print("tasks.db was replaced underneath us; reopening")
+        try:
+            _STORE.close()
+        except Exception:
+            pass
+        _STORE = None
+
     if _STORE is None:
         try:
-            if not STORE_FILE.exists():
-                return None
             _STORE = mhstore.open_store(root=MELLONHEAD_ROOT,
                                         seed_settings=False)
+            _STORE_FILE_ID = file_id
         except Exception as exc:
             print(f"store unavailable, falling back to markdown: {exc}")
             return None
@@ -3224,6 +3247,10 @@ function renderAll() {
 
 function renderPriorities() {
     const container = document.getElementById('prioritiesBar');
+    // A redraw replaces innerHTML, which destroys any open quick-add box and
+    // whatever was typed into it. Flags have proved too easy to clear from
+    // elsewhere, so ask the DOM directly.
+    if (container.querySelector('.quick-add-input')) return;
     const weeks = priorities.weeks?.length
         ? priorities.weeks
         : (priorities.days?.length ? [{title: priorities.weekTitle || 'This Week', days: priorities.days, isCurrent: true}] : []);
@@ -3309,9 +3336,18 @@ function startQuickAdd(el, day) {
     if (el.querySelector('input')) return;
     el.innerHTML = '<input class="quick-add-input" placeholder="New task, Enter to save">';
     const input = el.querySelector('input');
-    input.focus();
     isEditing = true;
+    // The click that opened this box is still bubbling. A document-level
+    // listener clears isEditing whenever the tag overlay is hidden, and it
+    // runs after this handler, so setting the flag here alone is not enough:
+    // the next poll would replace the DOM and destroy the box mid-word.
+    // renderPriorities also refuses to redraw while this input exists.
+    setTimeout(() => { isEditing = true; input.focus(); }, 0);
+
+    let closed = false;
     const finish = async (save) => {
+        if (closed) return;
+        closed = true;
         const title = input.value.trim();
         isEditing = false;
         if (save && title) {
@@ -3323,9 +3359,12 @@ function startQuickAdd(el, day) {
     };
     input.onkeydown = (e) => {
         if (e.key === 'Enter') { e.preventDefault(); finish(true); }
-        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+        if (e.key === 'Escape') { e.preventDefault(); closed = true; isEditing = false;
+                                  el.innerHTML = '+ add'; }
     };
-    input.onblur = () => finish(false);
+    // Clicking away keeps what was typed rather than discarding it. Losing a
+    // half-written task to an incidental focus change is the worse outcome.
+    input.onblur = () => finish(true);
 }
 
 async function storeAction(action, payload) {
@@ -3756,6 +3795,8 @@ function closeTagInput(event) {
 // Safety: reset isEditing if overlay is hidden but flag is stuck
 document.addEventListener('click', () => {
     const overlay = document.getElementById('tagInputOverlay');
+    // A quick-add box is an editor too, and it does not use this overlay.
+    if (document.querySelector('.quick-add-input')) return;
     if (isEditing && overlay && overlay.style.display === 'none') {
         isEditing = false;
     }

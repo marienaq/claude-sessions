@@ -54,6 +54,38 @@ class TestInlineFrontEnd(unittest.TestCase):
             finally:
                 os.unlink(path)
 
+    def test_open_quick_add_is_protected_from_redraw(self):
+        """
+        The page polls every 5 seconds and redraws by replacing innerHTML,
+        which destroys an open quick-add box and whatever was typed into it.
+        The isEditing flag alone was not enough: a document-level click
+        listener clears it whenever the tag overlay is hidden, and it runs
+        after the handler that opens the box, so the flag was already false
+        by the time the poll fired.
+
+        Two guards, both asked of the DOM rather than a flag. If either is
+        removed, typing a task name becomes impossible again.
+        """
+        js = "\n".join(self._scripts())
+        render = js[js.index("function renderPriorities()"):]
+        render = render[:render.index("\n}")]
+        self.assertIn("quick-add-input", render,
+                      "renderPriorities must not redraw over an open input")
+
+        watchdog = js[js.index("document.addEventListener('click'"):]
+        watchdog = watchdog[:watchdog.index("});") + 3]
+        self.assertIn("quick-add-input", watchdog,
+                      "the isEditing watchdog must not clear an open quick-add")
+
+    def test_quick_add_keeps_text_on_blur(self):
+        """Losing a half-written task to an incidental focus change is worse
+        than saving one the user meant to abandon; Escape still discards."""
+        js = "\n".join(self._scripts())
+        block = js[js.index("function startQuickAdd"):]
+        block = block[:block.index("\n}\n")]
+        self.assertIn("input.onblur = () => finish(true)", block)
+        self.assertIn("Escape", block)
+
     def test_every_onclick_handler_exists(self):
         """
         An onclick naming a function that was renamed away throws at click

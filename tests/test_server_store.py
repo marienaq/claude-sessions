@@ -131,6 +131,50 @@ class TestPrioritiesFromStore(ServerCase):
         self.assertFalse(p["weeks"][1]["isCurrent"])
 
 
+class TestStoreHandle(ServerCase):
+
+    def test_reopens_when_the_database_is_replaced(self):
+        """
+        A long-lived handle keeps writing to the old inode after tasks.db is
+        swapped out. SQLite reports success and the row never changes; three
+        real checkbox clicks were lost that way, with an audit trail saying
+        they had happened.
+        """
+        store = self.build_store()
+        store.add_project("proj", "P", dir="proj")
+        task = store.add_task("proj", "Original")
+        store.close()
+
+        server = self.load_server()
+        first = server.get_store()
+        self.assertIsNotNone(first)
+
+        # Replace the file, the way a rebuild or a restore does.
+        (self.repo / "operations" / "tasks.db").unlink()
+        for sidecar in ("tasks.db-wal", "tasks.db-shm"):
+            p = self.repo / "operations" / sidecar
+            if p.exists():
+                p.unlink()
+        fresh = mhstore.open_store(root=self.repo)
+        fresh.add_project("proj", "P", dir="proj")
+        fresh.add_task("proj", "Replacement")
+        fresh.close()
+
+        second = server.get_store()
+        titles = [t["title"] for t in second.tasks()]
+        self.assertIn("Replacement", titles,
+                      "the server must read the file that is on disk now")
+        self.assertNotIn("Original", titles)
+
+    def test_same_file_is_not_reopened(self):
+        store = self.build_store()
+        store.add_project("proj", "P", dir="proj")
+        store.add_task("proj", "Steady")
+        store.close()
+        server = self.load_server()
+        self.assertIs(server.get_store(), server.get_store())
+
+
 class TestFallback(ServerCase):
 
     def test_markdown_used_when_store_absent(self):
