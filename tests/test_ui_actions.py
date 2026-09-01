@@ -86,6 +86,38 @@ class TestInlineFrontEnd(unittest.TestCase):
         self.assertIn("input.onblur = () => finish(true)", block)
         self.assertIn("Escape", block)
 
+    def test_quick_add_clears_the_input_before_refreshing(self):
+        """
+        renderPriorities refuses to redraw while a quick-add input exists.
+        If finish() leaves the input in place and then calls fetchSessions,
+        it blocks the very refresh that would show the saved task, and the
+        box sits open forever even though the write succeeded.
+        """
+        js = "\n".join(self._scripts())
+        block = js[js.index("function startQuickAdd"):]
+        block = block[:block.index("\n}\n")]
+        clear_at = block.index("el.innerHTML = '+ add'")
+        fetch_at = block.index("fetchSessions(true)")
+        self.assertLess(clear_at, fetch_at,
+                        "the input must be removed before the refresh")
+
+    def test_drag_suppresses_the_redraw(self):
+        """
+        A drag lasts seconds; the poll redraws every five. Replacing innerHTML
+        mid-drag destroys the element under the cursor, so the day highlights
+        on dragover but the drop never lands.
+        """
+        js = "\n".join(self._scripts())
+        self.assertIn("isDragging", js)
+        start = js[js.index("function dragTaskStart"):]
+        start = start[:start.index("\n}")]
+        self.assertIn("isDragging = true", start)
+        self.assertIn("dragend", start, "the flag must be cleared when the drag ends")
+        for fn in ("function renderPriorities()", "function renderPanels()"):
+            body = js[js.index(fn):]
+            body = body[:body.index("\n}")]
+            self.assertIn("isDragging", body, f"{fn} must stand off during a drag")
+
     def test_every_onclick_handler_exists(self):
         """
         An onclick naming a function that was renamed away throws at click

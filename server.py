@@ -3251,6 +3251,7 @@ function renderPriorities() {
     // whatever was typed into it. Flags have proved too easy to clear from
     // elsewhere, so ask the DOM directly.
     if (container.querySelector('.quick-add-input')) return;
+    if (isDragging) return;
     const weeks = priorities.weeks?.length
         ? priorities.weeks
         : (priorities.days?.length ? [{title: priorities.weekTitle || 'This Week', days: priorities.days, isCurrent: true}] : []);
@@ -3304,11 +3305,22 @@ function renderPriorities() {
 
 // --- drag a task onto a different day ------------------------------------
 
+let isDragging = false;
+
 function dragTaskStart(ev) {
     const id = ev.currentTarget.dataset.id;
     if (!id) return;
     ev.dataTransfer.setData('text/plain', id);
     ev.dataTransfer.effectAllowed = 'move';
+    // A drag lasts seconds. The five-second poll redraws by replacing
+    // innerHTML, which destroys the element under the cursor and aborts the
+    // drag: the day highlights on dragover but the drop never lands.
+    isDragging = true;
+    ev.currentTarget.addEventListener('dragend', () => {
+        isDragging = false;
+        document.querySelectorAll('.drop-target')
+            .forEach(el => el.classList.remove('drop-target'));
+    }, {once: true});
 }
 
 function dragOverDay(ev) {
@@ -3350,11 +3362,14 @@ function startQuickAdd(el, day) {
         closed = true;
         const title = input.value.trim();
         isEditing = false;
+        // Take the input out of the DOM before refreshing. renderPriorities
+        // refuses to redraw while one exists, so leaving it in place blocks
+        // the very refresh that would show the saved task: it saves, then
+        // sits there as an open box forever.
+        el.innerHTML = '+ add';
         if (save && title) {
             await storeAction('task/add', {title, plannedDay: day});
             fetchSessions(true);
-        } else {
-            el.innerHTML = '+ add';
         }
     };
     input.onkeydown = (e) => {
@@ -3394,6 +3409,7 @@ async function taskAction(action, id) {
 function renderPanels() {
     const container = document.getElementById('panelsBar');
     if (!container) return;
+    if (isDragging) return;   // dragging out of a panel must survive a poll
     if (!panels.available) { container.innerHTML = ''; return; }
 
     const itemRow = (item, actions) => `<div class="panel-item" draggable="true"
