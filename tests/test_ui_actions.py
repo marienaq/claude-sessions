@@ -118,6 +118,27 @@ class TestInlineFrontEnd(unittest.TestCase):
             body = body[:body.index("\n}")]
             self.assertIn("isDragging", body, f"{fn} must stand off during a drag")
 
+    def test_poll_only_redraws_changed_sections(self):
+        """
+        The five-second poll exists for the session cards, which change
+        constantly. The priorities bar and panels do not: measured over six
+        seconds, sessions differed and both of those were byte-identical.
+        Redrawing them anyway replaced innerHTML twelve times a minute, which
+        is what destroyed an open quick-add box and aborted a drag.
+        """
+        js = "\n".join(self._scripts())
+        fetch = js[js.index("async function fetchSessions"):]
+        fetch = fetch[:fetch.index("\n}")]
+        self.assertIn("lastPrioritiesJson", fetch)
+        self.assertIn("lastPanelsJson", fetch)
+
+        render = js[js.index("function renderAll("):]
+        render = render[:render.index("\n}")]
+        self.assertIn("changed.priorities", render)
+        self.assertIn("changed.panels", render)
+        # A bare renderAll() after a write must still redraw everything.
+        self.assertIn("!changed", render)
+
     def test_every_onclick_handler_exists(self):
         """
         An onclick naming a function that was renamed away throws at click

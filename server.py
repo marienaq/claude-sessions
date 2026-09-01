@@ -3138,6 +3138,9 @@ const expandedSections = new Set();
 
 const PALETTE = ['purple','green','blue','red','orange','pink','teal','yellow'];
 
+let lastPrioritiesJson = null;
+let lastPanelsJson = null;
+
 async function fetchSessions(force = false) {
     if (isEditing && !force) return;
     try {
@@ -3147,7 +3150,20 @@ async function fetchSessions(force = false) {
         colorGroups = data.colorGroups || {};
         priorities = data.priorities || {};
         panels = data.panels || {available: false, backlog: [], proposed: [], projects: []};
-        renderAll();
+
+        // The poll exists for the session cards, which really do change every
+        // few seconds. The priorities bar and the panels almost never do, and
+        // redrawing them anyway replaces innerHTML twelve times a minute:
+        // that is what destroyed an open quick-add box and aborted a drag.
+        // Only redraw a section when its data actually differs.
+        const prioritiesJson = JSON.stringify(data.priorities || {});
+        const panelsJson = JSON.stringify(data.panels || {});
+        const prioritiesChanged = prioritiesJson !== lastPrioritiesJson;
+        const panelsChanged = panelsJson !== lastPanelsJson;
+        lastPrioritiesJson = prioritiesJson;
+        lastPanelsJson = panelsJson;
+
+        renderAll({priorities: prioritiesChanged, panels: panelsChanged});
     } catch(e) {
         console.error('Fetch error:', e);
     }
@@ -3237,9 +3253,11 @@ function getFilteredSessions() {
     return filtered;
 }
 
-function renderAll() {
-    renderPriorities();
-    renderPanels();
+function renderAll(changed) {
+    // No argument means "redraw everything": the direct callers after a write
+    // want the new state on screen regardless.
+    if (!changed || changed.priorities) renderPriorities();
+    if (!changed || changed.panels) renderPanels();
     renderTagCloudInline();
     renderFilterBar();
     renderCards();
