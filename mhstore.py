@@ -553,6 +553,16 @@ class Store:
         if load is not None and load not in LOADS:
             raise StoreError(f"bad load {load!r}")
 
+        # Give the row a per-project number if the caller did not. Without one
+        # a task created in the UI or the CLI has no key#N, so it cannot be
+        # referenced by the convention every skill and every day-card line
+        # uses, and it renders in the markdown with a raw store id.
+        display_ord = fields.get("display_ord")
+        if display_ord is None and project_key != ONE_OFF:
+            existing = [t["display_ord"] for t in self.tasks(project_key=project_key)]
+            numbers = [int(o) for o in existing if o and str(o).isdigit()]
+            display_ord = str(max(numbers) + 1) if numbers else "1"
+
         now = _now()
         cols = {
             "project_key": project_key, "title": title, "status": status,
@@ -561,7 +571,7 @@ class Store:
             "seq": fields.get("seq"),
             "is_next": 1 if fields.get("is_next") else 0,
             "section": fields.get("section"),
-            "display_ord": fields.get("display_ord"),
+            "display_ord": display_ord,
             "load": load, "due": fields.get("due"),
             "planned_day": fields.get("planned_day"),
             "depends_on": fields.get("depends_on"),
@@ -614,6 +624,13 @@ class Store:
                 fields["done_at"] = date.today().isoformat()
             elif fields["status"] != "done" and before["done_at"]:
                 fields["done_at"] = None
+
+        # A row that is no longer waiting is not waiting on anything. Leaving
+        # the reason behind renders a finished task as "done, waiting on
+        # Sharla's review", which reads as unfinished.
+        if ("status" in fields and fields["status"] != "waiting"
+                and "waiting_on" not in fields and before["waiting_on"]):
+            fields["waiting_on"] = None
 
         sets = ", ".join(f"{k} = ?" for k in fields) + ", updated_at = ?"
         self.conn.execute(f"UPDATE tasks SET {sets} WHERE id = ?",

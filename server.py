@@ -18,8 +18,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     import mhstore
+    import mhgen
 except ImportError:                     # store not installed; markdown only
     mhstore = None
+    mhgen = None
 
 # Everything below can be pointed at a scratch copy so a dev instance never
 # touches live state. See operations/prioritization-implementation-plan.md 5.7.
@@ -115,6 +117,29 @@ def store_is_live():
         ).fetchone())
     except Exception:
         return False
+
+
+def regenerate_views(project_keys=()):
+    """
+    Invariant 4: a write regenerates the views it affects, in the same call.
+
+    The CLI already did this; the dashboard did not, so a checkbox updated the
+    store and left task-list.md stale. `mh verify` caught three files that way.
+    Measured at about 4ms for a task list, priorities.md and the dashboard
+    together, which is far too cheap to skip.
+
+    Never let a generation failure break the write that already succeeded.
+    """
+    store = get_store()
+    if store is None or mhgen is None:
+        return
+    try:
+        for key in {k for k in project_keys if k and k != mhstore.ONE_OFF}:
+            mhgen.generate_task_list(store, MELLONHEAD_ROOT, key)
+        mhgen.generate_priorities(store, MELLONHEAD_ROOT)
+        mhgen.generate_dashboard(store, MELLONHEAD_ROOT)
+    except Exception as exc:
+        print(f"regeneration failed after a write: {exc}")
 
 
 def load_store():
@@ -1683,6 +1708,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     store.reopen_task(task["id"], actor="mq",
                                       status="planned" if task["planned_day"]
                                       else "backlog")
+                regenerate_views([task["project_key"]])
                 self.send_json({"ok": True, "id": task["id"]})
                 return
 
@@ -1745,6 +1771,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         status="planned" if body.get("plannedDay") else "backlog",
                         planned_day=body.get("plannedDay"),
                         load=body.get("load"), due=body.get("due"))
+                    regenerate_views([project_key])
                     self.send_json({"ok": True, "id": task["id"]})
                     return
 
@@ -1755,6 +1782,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.send_json({"ok": False, "error": "No week"}, 400)
                         return
                     store.lock_week(week_start, actor="mq")
+                    regenerate_views(
+                        {t["project_key"] for t in store.tasks() if t["planned_day"]})
                     self.send_json({"ok": True, "weekStart": week_start})
                     return
 
@@ -1787,6 +1816,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.send_json({"ok": False, "error": "Unknown action"}, 404)
                     return
+                regenerate_views([task["project_key"]])
                 self.send_json({"ok": True, "id": task["id"]})
             except mhstore.StoreError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 400)
@@ -1937,6 +1967,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 store.complete_task(task["id"], actor="mq")
                 nxt = store.next_task(task["project_key"])
+                regenerate_views([task["project_key"]])
                 self.send_json({"ok": True, "id": task["id"],
                                 "next": nxt["title"] if nxt else None})
                 return

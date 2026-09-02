@@ -1,0 +1,4 @@
+#!/bin/bash
+# mh — the write path for agents. Installed into the content repo as
+# operations/mh; the implementation lives with the session manager.
+exec /opt/homebrew/bin/python3 "$(dirname "$(readlink -f "$0")")/mhcli.py" "$@"
