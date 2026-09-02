@@ -208,6 +208,43 @@ class TestNeverCreatesAStore(unittest.TestCase):
                              "a read must not create a database")
 
 
+class TestReference(unittest.TestCase):
+    """
+    The reference is generated from the parser. A hand-written one drifts and
+    nobody notices until an agent runs a command that no longer exists.
+    """
+
+    def test_committed_reference_matches_the_parser(self):
+        committed = Path(__file__).resolve().parent.parent / "mh-reference.md"
+        self.assertTrue(committed.exists(), "mh-reference.md is missing")
+        self.assertEqual(
+            committed.read_text().strip(),
+            mhcli.render_reference().strip(),
+            "mh-reference.md is stale; regenerate with `mh docs > "
+            "mh-reference.md`")
+
+    def test_every_command_appears(self):
+        text = mhcli.render_reference()
+        for command in ("mh task done", "mh task add", "mh task note",
+                        "mh task find", "mh plan lock", "mh verify",
+                        "mh regen", "mh export"):
+            self.assertIn(command, text, f"{command} is undocumented")
+
+    def test_the_rules_are_stated(self):
+        text = mhcli.render_reference()
+        self.assertIn("Never edit", text)
+        self.assertIn("mh verify", text)
+
+    def test_docs_runs_without_a_store(self):
+        """The reference has to be readable before anything is migrated."""
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = mhcli.main(["--repo", tmp, "docs"])
+            self.assertEqual(code, 0)
+            self.assertIn("command reference", buf.getvalue())
+
+
 class TestReadCommands(CliCase):
 
     def test_next_across_projects(self):

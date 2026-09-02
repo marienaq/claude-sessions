@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mellonhead-store"
+version = "0.1.0"
+description = "Task store, migration, generators and CLI behind the Claude session manager"
+requires-python = ">=3.11"
+
+# No third-party dependencies, deliberately. server.py is stdlib-only by
+# design and the store has to keep working if pip is unavailable or an
+# install goes wrong. Being a package is not the same as taking a dependency.
+dependencies = []
+
+[project.scripts]
+mh = "mhcli:main"
+
+[tool.setuptools]
+py-modules = ["mhstore", "mhgen", "mhmigrate", "mhcli", "check_mh_usage"]
+
+[tool.setuptools.package-data]
+"*" = ["mh-reference.md"]

@@ -1,4 +1,30 @@
 #!/bin/bash
-# mh — the write path for agents. Installed into the content repo as
-# operations/mh; the implementation lives with the session manager.
-exec /opt/homebrew/bin/python3 "$(dirname "$(readlink -f "$0")")/mhcli.py" "$@"
+# mh — the write path for agents.
+#
+# Installed at <repo>/operations/mh. Two things it must get right:
+#   the repo it operates on, derived from its own location, never a default
+#   the code it runs, which lives with the session manager
+#
+# The implementation is searched for rather than hardcoded: during Phase 2 it
+# sits in a git worktree that disappears when the branch merges, and a shim
+# pointing at a deleted directory fails at the worst moment.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export MELLONHEAD_ROOT="${MELLONHEAD_ROOT:-$(dirname "$HERE")}"
+
+for candidate in \
+    "${MH_CODE:-}" \
+    "$HOME/Projects/claude-sessions" \
+    "$HOME/Projects/claude-sessions-phase2" \
+    "$HERE"
+do
+    [ -n "$candidate" ] && [ -f "$candidate/mhcli.py" ] && {
+        exec /opt/homebrew/bin/python3 "$candidate/mhcli.py" "$@"
+    }
+done
+
+echo "mh: cannot find mhcli.py." >&2
+echo "Looked in \$MH_CODE, ~/Projects/claude-sessions," >&2
+echo "~/Projects/claude-sessions-phase2, and $HERE." >&2
+exit 127
