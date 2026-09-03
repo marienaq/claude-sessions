@@ -32,5 +32,9 @@ rsync -a --delete \
 # apply, so clear it after the fact.
 rm -rf "${DEST:?}/.git"
 
+# The mirror above deletes anything not in the source, which includes the
+# reference doc. Reinstall the entry point after every refresh.
+"$(dirname "${BASH_SOURCE[0]}")/install-mh.sh" "$DEST" >/dev/null
+
 echo "done: $(du -sh "$DEST" | cut -f1), $(find "$DEST" -name '*.md' | wc -l | tr -d ' ') markdown files"
 echo "git repo: $(git -C "$DEST" rev-parse --git-dir 2>/dev/null || echo 'none (cannot be pushed)')"
