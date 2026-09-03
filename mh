@@ -1,30 +1,51 @@
 #!/bin/bash
 # mh — the write path for agents.
 #
-# Installed at <repo>/operations/mh. Two things it must get right:
-#   the repo it operates on, derived from its own location, never a default
-#   the code it runs, which lives with the session manager
+# Two ways to call it, both supported:
+#   ./operations/mh task done aba-academy#25     from the repo, no install
+#   mh task done aba-academy#25                  anywhere, if symlinked onto PATH
 #
-# The implementation is searched for rather than hardcoded: during Phase 2 it
-# sits in a git worktree that disappears when the branch merges, and a shim
-# pointing at a deleted directory fails at the worst moment.
+# The repo is found the way git finds one: walk up from the working directory
+# looking for operations/tasks.db. That makes both forms work from any
+# subdirectory, and means a symlink on PATH does not have to guess.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export MELLONHEAD_ROOT="${MELLONHEAD_ROOT:-$(dirname "$HERE")}"
+# Only two ways to decide which repo this acts on: an explicit
+# MELLONHEAD_ROOT, or a store found by walking up from the working directory.
+#
+# There is deliberately no fallback to the script's own location. When this is
+# a symlink on PATH, that fallback made `mh` standing in a repo with no store
+# silently operate on whichever repo the symlink happened to live in, and
+# report its rows as though they were this one's. Wrong target, no warning.
+find_repo() {
+    [ -n "${MELLONHEAD_ROOT:-}" ] && { echo "$MELLONHEAD_ROOT"; return; }
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        [ -f "$dir/operations/tasks.db" ] && { echo "$dir"; return; }
+        dir="$(dirname "$dir")"
+    done
+    echo ""
+}
+
+REPO="$(find_repo)"
+if [ -n "$REPO" ]; then
+    export MELLONHEAD_ROOT="$REPO"
+elif [[ " $* " != *" --repo "* ]]; then
+    echo "mh: no task store found." >&2
+    echo "Looked for operations/tasks.db from $PWD upwards." >&2
+    echo "Set MELLONHEAD_ROOT, pass --repo, or run from inside the repo." >&2
+    exit 2
+fi
 
 for candidate in \
     "${MH_CODE:-}" \
     "$HOME/Projects/claude-sessions" \
-    "$HOME/Projects/claude-sessions-phase2" \
-    "$HERE"
+    "$HOME/Projects/claude-sessions-phase2"
 do
     [ -n "$candidate" ] && [ -f "$candidate/mhcli.py" ] && {
         exec /opt/homebrew/bin/python3 "$candidate/mhcli.py" "$@"
     }
 done
 
-echo "mh: cannot find mhcli.py." >&2
-echo "Looked in \$MH_CODE, ~/Projects/claude-sessions," >&2
-echo "~/Projects/claude-sessions-phase2, and $HERE." >&2
+echo "mh: cannot find mhcli.py. Set \$MH_CODE to the session-manager checkout." >&2
 exit 127
