@@ -117,7 +117,22 @@ def check(command, parser):
     required = [a for a in leaf._actions
                 if not a.option_strings and a.dest != "help"
                 and a.nargs not in ("?", "*")]
-    supplied = [w for w in rest if not w.startswith("-")]
+
+    # A word after a value-taking option belongs to that option, not to a
+    # positional. Counting "capture" in `--source capture` as a positional
+    # made a partial reference look complete, and it was then rejected for a
+    # missing argument prose never supplies.
+    takes_value = {o for a in leaf._actions for o in a.option_strings
+                   if a.nargs != 0 and not isinstance(a, __import__("argparse")._StoreTrueAction)}
+    supplied, skip = [], False
+    for word in rest:
+        if skip:
+            skip = False
+            continue
+        if word.startswith("-"):
+            skip = word in takes_value and "=" not in word
+            continue
+        supplied.append(word)
     if len(supplied) < len(required):
         # Still worth catching a misspelled option in a partial reference.
         known = {o for a in leaf._actions for o in a.option_strings}

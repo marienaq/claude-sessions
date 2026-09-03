@@ -422,6 +422,22 @@ class TestSkillCommandChecker(unittest.TestCase):
         text = "Run `mh task done proj#1 --force`."
         self.assertTrue([r for r in self.check(text) if r])
 
+    def test_option_values_are_not_counted_as_positionals(self):
+        """
+        `mh task add --source capture --unconfirmed` supplies no title.
+        Counting "capture" as a positional made the reference look complete,
+        and it was then rejected for an argument prose never supplies.
+        """
+        text = "Propose it with `mh task add --source capture --unconfirmed`."
+        self.assertEqual([r for r in self.check(text) if r], [])
+
+    def test_a_complete_invocation_is_fully_validated(self):
+        """Once every positional is supplied, argparse checks the values."""
+        self.assertTrue([r for r in self.check(
+            "Run `mh task status proj#1 stuck`.") if r])
+        self.assertEqual([r for r in self.check(
+            "Run `mh task status proj#1 waiting`.") if r], [])
+
     def test_prose_mentioning_mh_is_not_a_false_positive(self):
         text = ("The mh CLI is the write path.\n"
                 "Never edit the file by hand.\n"
