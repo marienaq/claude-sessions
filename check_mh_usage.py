@@ -62,8 +62,40 @@ def extract(text):
     return found
 
 
+def walk(parser, argv):
+    """
+    Follow argv down the subparser tree. Returns (leaf, remaining, bad_word).
+
+    bad_word is set when a word should have named a subcommand and did not,
+    which is the invented-command case worth reporting.
+    """
+    import argparse as _ap
+    while argv:
+        groups = next((a for a in parser._actions
+                       if isinstance(a, _ap._SubParsersAction)), None)
+        if groups is None:
+            return parser, argv, None
+        word = argv[0]
+        if word.startswith("-"):
+            return parser, argv, None
+        if word not in groups.choices:
+            return parser, argv, word
+        parser = groups.choices[word]
+        argv = argv[1:]
+    return parser, argv, None
+
+
 def check(command, parser):
-    """Parse one invocation. Returns None if valid, else the reason."""
+    """
+    Parse one invocation. Returns None if valid, else the reason.
+
+    Prose names commands without their arguments — "close it with
+    `mh task done`" is a reference, not a prescription — so a missing
+    positional is not an error. What is worth catching is a subcommand that
+    does not exist, or a value outside a fixed set. Flagging both alike made
+    eleven of thirteen findings in the handoff brief false positives, which
+    is how a checker gets ignored.
+    """
     try:
         argv = shlex.split(substitute(command))
     except ValueError as exc:
@@ -73,15 +105,31 @@ def check(command, parser):
     argv = argv[1:]
     if not argv:
         return "bare `mh` with no subcommand"
-    # argparse writes its own usage text to stderr on a bad command. The
-    # report below says what is wrong more usefully, so swallow it.
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(argv)
-    except SystemExit:
-        return "not a valid mh command"
-    except Exception as exc:                     # noqa: BLE001
-        return f"{type(exc).__name__}: {exc}"
+
+    leaf, rest, bad = walk(parser, argv)
+    if bad:
+        return f"no such command: `{bad}`"
+
+    # The command path is real. Only check values if enough were supplied to
+    # judge them; a bare reference has none.
+    # Match by position across all positionals, then check only the ones that
+    # constrain their value. Pairing "the first constrained argument" with
+    # "the first word" crosses `task` and `status` in `mh task status X done`.
+    slots = [a for a in leaf._actions
+             if not a.option_strings and a.dest != "help"]
+    supplied = [w for w in rest if not w.startswith("-")]
+    for action, word in zip(slots, supplied):
+        if not action.choices or word.startswith("<"):
+            continue
+        if word not in action.choices:
+            allowed = ", ".join(str(c) for c in action.choices)
+            return f"`{word}` is not a valid {action.dest} ({allowed})"
+
+    # Flags are cheap to verify and a wrong one is always a real mistake.
+    known = {o for a in leaf._actions for o in a.option_strings}
+    for word in rest:
+        if word.startswith("--") and word.split("=")[0] not in known:
+            return f"unknown option: `{word.split('=')[0]}`"
     return None
 
 

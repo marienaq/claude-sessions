@@ -320,6 +320,28 @@ class TestSkillCommandChecker(unittest.TestCase):
         text = "Set it with `mh task status proj#1 finished`."
         self.assertTrue([r for r in self.check(text) if r])
 
+    def test_naming_a_command_without_arguments_is_a_reference(self):
+        """
+        "close it with `mh task done`" names a real command; it is not a
+        prescription missing an argument. Treating those as errors made
+        eleven of thirteen findings in the handoff brief false positives,
+        which is how a checker gets ignored.
+        """
+        text = ("Close it with `mh task done`.\n"
+                "Add one with `mh task add`.\n"
+                "Record it with `mh task note`.\n")
+        self.assertEqual([r for r in self.check(text) if r], [])
+
+    def test_positionals_are_matched_by_position(self):
+        """`mh task status <task> <status>` must not check <task> against the
+        status choices."""
+        text = "Run `mh task status aba-academy#25 waiting`."
+        self.assertEqual([r for r in self.check(text) if r], [])
+
+    def test_unknown_option_is_caught(self):
+        text = "Run `mh task done proj#1 --force`."
+        self.assertTrue([r for r in self.check(text) if r])
+
     def test_prose_mentioning_mh_is_not_a_false_positive(self):
         text = ("The mh CLI is the write path.\n"
                 "Never edit the file by hand.\n"
