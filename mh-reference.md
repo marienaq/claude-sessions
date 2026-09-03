@@ -58,6 +58,7 @@ works as-is.
 
 | Command | Options | What it does |
 |---|---|---|
+| `mh project add <key> <name>` | `--dir` `--due` `--goal` `--notion` `--owner` `--status` | register a new project |
 | `mh project list` | `--all` | every live project, with its next action |
 | `mh project status <project> <status>` | — | set a project's status |
 

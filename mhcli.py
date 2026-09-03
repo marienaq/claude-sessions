@@ -352,6 +352,22 @@ def cmd_project_list(store, repo, args):
     return 0
 
 
+def cmd_project_add(store, repo, args):
+    if store.project(args.key):
+        raise CliError(f"project {args.key!r} already exists")
+    project = store.add_project(
+        args.key, args.name, actor=args.actor, dir=args.dir,
+        status=mhstore.normalize_project_status(args.status),
+        owner=args.owner or "mq", due=args.due,
+        notion_project_id=args.notion, goal=args.goal)
+    print(f"{project['key']:<18} {project['status']:<9} {project['name']}")
+    if project["dir"]:
+        print(f"  dir: {project['dir']}")
+        print("  add a row to operations/project-registry.md so the migration "
+              "and the dashboard see it too.")
+    return 0
+
+
 def cmd_project_status(store, repo, args):
     status = mhstore.normalize_project_status(args.status)
     store.update_project(args.project, actor=args.actor, status=status)
@@ -731,6 +747,17 @@ def build_parser():
     project = sub.add_parser("project", help="projects",
                              parents=[common]).add_subparsers(
         dest="action", required=True)
+    p = project.add_parser("add", help="register a new project", parents=[common])
+    p.add_argument("key", help="short slug, e.g. aba-academy")
+    p.add_argument("name")
+    p.add_argument("--dir", help="repo-relative directory holding its task-list.md")
+    p.add_argument("--status", default="active")
+    p.add_argument("--owner")
+    p.add_argument("--due")
+    p.add_argument("--notion", help="Notion project id, contractor rows only")
+    p.add_argument("--goal")
+    p.set_defaults(fn=cmd_project_add)
+
     p = project.add_parser("list", help="every live project, with its next action", parents=[common])
     p.add_argument("--all", action="store_true", help="include archived")
     p.set_defaults(fn=cmd_project_list)
