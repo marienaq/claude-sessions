@@ -51,6 +51,24 @@ _NULL_SENTINELS = {
     "(no notion task)", "no notion task", "null",
 }
 
+# The two enums spell "cancel" differently: tasks took the plan's spelling,
+# projects took Phase 1's, and build-dashboard.py archives on "cancelled".
+# Neither can change without breaking one of them, so both spellings are
+# accepted on input and mapped to whichever the target enum uses. A caller
+# should never have to remember which noun takes which spelling.
+_TASK_STATUS_ALIASES = {"cancelled": "canceled", "killed": "canceled",
+                        "blocked": "waiting", "not started": "backlog",
+                        "in progress": "in_progress", "todo": "backlog"}
+
+
+def normalize_task_status(value):
+    """Fold spelling and near-miss variants onto the task enum."""
+    text = (clean(value) or "").lower().strip().replace("-", "_")
+    text = _TASK_STATUS_ALIASES.get(text.replace("_", " "), text)
+    text = _TASK_STATUS_ALIASES.get(text, text)
+    return text if text in TASK_STATUSES else None
+
+
 # Owner is written as "MQ" in the markdown; the plan's enum is lower case.
 _OWNER_ALIASES = {"mq": "mq", "mariena": "mq", "": "mq"}
 

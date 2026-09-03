@@ -43,6 +43,8 @@ works as-is.
 | `mh task done <task>` | — | close a task |
 | `mh task status <task> <status>` | `--waiting-on` | set a task's status |
 | `mh task note <task> <text>` | — | append a dated entry to the note file |
+| `mh task plan <task> <day>` | — | put a task on a day, or take it off |
+| `mh task load <task> <load>` | — | set a task's load tag |
 | `mh task seq <task> <seq>` | — | set ordering within a project |
 | `mh task confirm <task>` | — | accept a capture proposal |
 | `mh task brief <task> <path>` | — | record a brief file path |
@@ -52,6 +54,7 @@ works as-is.
 | Command | Options | What it does |
 |---|---|---|
 | `mh plan lock <week>` | — | commit a proposed week |
+| `mh plan propose <week>` | `--force` `--notes` | mark a week proposed, awaiting MQ |
 | `mh plan show <week>` | — | the week's day cards |
 
 ### `mh project`
@@ -71,6 +74,7 @@ works as-is.
 | `mh regen` | rewrite every generated view |
 | `mh export` | a readable copy that needs no SQLite |
 | `mh docs` | print this command reference as markdown |
+| `mh check-skills` | verify mh commands quoted in .claude are real |
 
 ### Global flags
 

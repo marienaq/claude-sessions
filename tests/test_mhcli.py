@@ -152,6 +152,86 @@ class TestWrites(CliCase):
         self.assertEqual(code, 1)
 
 
+class TestPlanning(CliCase):
+    """
+    Planning a week is mostly moving already-open rows onto days. Without
+    these the CLI could create work but never schedule it, so Mode 5 could
+    not finalize and the Friday job could not write a proposed week at all.
+    """
+
+    def test_plan_an_existing_row_onto_a_day(self):
+        self.store.add_task("proj", "Schedulable", display_ord="1")
+        self.run_cli("task", "plan", "proj#1", "2026-09-04", "--no-regen")
+        task = self.store.tasks(project_key="proj")[0]
+        self.assertEqual(task["planned_day"], "2026-09-04")
+        self.assertEqual(task["status"], "planned")
+
+    def test_plan_with_no_day_unschedules(self):
+        self.store.add_task("proj", "Schedulable", display_ord="1",
+                            planned_day="2026-09-04", status="planned")
+        self.run_cli("task", "plan", "proj#1", "--no-regen")
+        task = self.store.tasks(project_key="proj")[0]
+        self.assertIsNone(task["planned_day"])
+        self.assertEqual(task["status"], "backlog")
+
+    def test_load_can_be_set_and_cleared(self):
+        self.store.add_task("proj", "Weighted", display_ord="1")
+        self.run_cli("task", "load", "proj#1", "deep", "--no-regen")
+        self.assertEqual(self.store.tasks(project_key="proj")[0]["load"], "deep")
+        self.run_cli("task", "load", "proj#1", "none", "--no-regen")
+        self.assertIsNone(self.store.tasks(project_key="proj")[0]["load"])
+
+    def test_propose_marks_the_week_without_locking(self):
+        code, out = self.run_cli("plan", "propose", "2026-09-07",
+                                 "--notes", "Assembled by the Friday job",
+                                 "--no-regen")
+        self.assertEqual(code, 0)
+        week = self.store.week("2026-09-07")
+        self.assertIsNotNone(week["proposed_at"])
+        self.assertIsNone(week["locked_at"], "a proposal is not a commitment")
+        self.assertEqual(week["notes"], "Assembled by the Friday job")
+
+    def test_propose_refuses_a_locked_week_unless_forced(self):
+        self.store.upsert_week("2026-09-07", locked_at="2026-09-05T10:00:00")
+        code, _ = self.run_cli("plan", "propose", "2026-09-07", "--no-regen")
+        self.assertEqual(code, 1)
+        code, _ = self.run_cli("plan", "propose", "2026-09-07", "--force",
+                               "--no-regen")
+        self.assertEqual(code, 0)
+        self.assertIsNone(self.store.week("2026-09-07")["locked_at"])
+
+
+class TestStatusSpelling(CliCase):
+    """
+    The task enum says "canceled" and the project enum says "cancelled".
+    Neither can change without breaking the other, so both spellings are
+    accepted. The developer doing 2.6 hit this on their first run.
+    """
+
+    def test_both_spellings_are_accepted(self):
+        self.store.add_task("proj", "Doomed", display_ord="1")
+        for spelling in ("cancelled", "canceled"):
+            self.run_cli("task", "status", "proj#1", spelling, "--no-regen")
+            self.assertEqual(
+                self.store.tasks(project_key="proj")[0]["status"], "canceled")
+            self.run_cli("task", "status", "proj#1", "backlog", "--no-regen")
+
+    def test_markdown_wording_is_accepted(self):
+        self.store.add_task("proj", "Wordy", display_ord="1")
+        for word, expected in (("Killed", "canceled"), ("blocked", "waiting"),
+                               ("not started", "backlog"),
+                               ("in progress", "in_progress")):
+            self.run_cli("task", "status", "proj#1", word, "--no-regen")
+            self.assertEqual(
+                self.store.tasks(project_key="proj")[0]["status"], expected,
+                f"{word!r} should map to {expected}")
+
+    def test_nonsense_is_still_rejected(self):
+        self.store.add_task("proj", "X", display_ord="1")
+        with self.assertRaises(SystemExit):
+            self.run_cli("task", "status", "proj#1", "almost-done")
+
+
 class TestRegeneration(CliCase):
 
     def test_a_write_regenerates_the_task_list(self):

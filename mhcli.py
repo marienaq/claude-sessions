@@ -42,6 +42,21 @@ class CliError(Exception):
     pass
 
 
+def _task_status(value):
+    """
+    Accept either spelling of cancel, and the markdown's wording.
+
+    The task enum says "canceled" and the project enum says "cancelled";
+    making a caller remember which noun takes which spelling is a trap.
+    """
+    status = mhstore.normalize_task_status(value)
+    if status is None:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a task status "
+            f"({', '.join(mhstore.TASK_STATUSES)})")
+    return status
+
+
 def resolve(store, ident):
     """
     'aba-academy#25' -> that project's row 25. A bare number is a store id.
@@ -247,6 +262,62 @@ def cmd_task_note(store, repo, args):
     print(f"appended to {rel}")
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
+def cmd_task_plan(store, repo, args):
+    """
+    Put an existing row on a day, or take it off one.
+
+    Planning a week is mostly moving already-open rows onto days, so without
+    this the CLI could create work but never schedule it: Mode 5 could not
+    finalize and the Friday job could not write a proposed week at all.
+    """
+    task = resolve(store, args.task)
+    if args.day:
+        store.plan_task(task["id"], args.day, actor=args.actor)
+    else:
+        store.unplan_task(task["id"], actor=args.actor)
+    print(show(store.task(task["id"])))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
+def cmd_task_load(store, repo, args):
+    task = resolve(store, args.task)
+    store.update_task(task["id"], actor=args.actor,
+                      load=None if args.load == "none" else args.load)
+    print(show(store.task(task["id"])))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
+def cmd_plan_propose(store, repo, args):
+    """
+    Mark a week proposed: assembled, waiting on MQ, not committed.
+
+    Nothing set proposed_at except migration, so the Friday job had no way to
+    say "here is next week, react to it".
+    """
+    week = store.week(args.week) or {}
+    if week.get("locked_at") and not args.force:
+        raise CliError(f"{args.week} is already locked; pass --force to "
+                       f"reopen it as a proposal")
+    fields = {"proposed_at": datetime.now().isoformat(timespec="seconds")}
+    if args.force:
+        fields["locked_at"] = None
+    if args.notes:
+        fields["notes"] = args.notes
+    store.upsert_week(args.week, actor=args.actor, **fields)
+    rows = [t for t in store.tasks() if t["planned_day"]
+            and args.week <= t["planned_day"] <= _week_end(args.week)]
+    print(f"proposed {args.week}  ({len(rows)} rows on day cards)")
+    print("MQ confirms in the session manager, or with `mh plan lock "
+          f"{args.week}`.")
+    if not args.no_regen:
+        regenerate(store, repo, {t["project_key"] for t in rows})
     return 0
 
 
@@ -473,6 +544,18 @@ def cmd_export(store, repo, args):
     out.write_text("\n".join(lines) + "\n")
     print(f"wrote {out.relative_to(repo)}  ({len(store.tasks())} tasks)")
     return 0
+
+
+def cmd_check_skills(store, repo, args):
+    """
+    Validate every mh command quoted in the skill and agent files.
+
+    Reachable through the CLI so nobody needs to know where the
+    implementation checkout lives.
+    """
+    import check_mh_usage
+    target = args.path or (repo / ".claude")
+    return check_mh_usage.main([str(target)])
 
 
 def cmd_docs(store, repo, args):
@@ -711,7 +794,8 @@ def build_parser():
 
     p = task.add_parser("status", help="set a task's status", parents=[common])
     p.add_argument("task")
-    p.add_argument("status", choices=mhstore.TASK_STATUSES)
+    p.add_argument("status", type=_task_status,
+                   help="one of: " + ", ".join(mhstore.TASK_STATUSES))
     p.add_argument("--waiting-on")
     p.set_defaults(fn=cmd_task_status)
 
@@ -719,6 +803,16 @@ def build_parser():
     p.add_argument("task")
     p.add_argument("text")
     p.set_defaults(fn=cmd_task_note)
+
+    p = task.add_parser("plan", help="put a task on a day, or take it off", parents=[common])
+    p.add_argument("task")
+    p.add_argument("day", nargs="?", help="YYYY-MM-DD; omit to unschedule")
+    p.set_defaults(fn=cmd_task_plan)
+
+    p = task.add_parser("load", help="set a task's load tag", parents=[common])
+    p.add_argument("task")
+    p.add_argument("load", choices=(*mhstore.LOADS, "none"))
+    p.set_defaults(fn=cmd_task_load)
 
     p = task.add_parser("seq", help="set ordering within a project", parents=[common])
     p.add_argument("task")
@@ -740,6 +834,13 @@ def build_parser():
     p = plan.add_parser("lock", help="commit a proposed week", parents=[common])
     p.add_argument("week", help="Monday, YYYY-MM-DD")
     p.set_defaults(fn=cmd_plan_lock)
+    p = plan.add_parser("propose", help="mark a week proposed, awaiting MQ", parents=[common])
+    p.add_argument("week", help="Monday, YYYY-MM-DD")
+    p.add_argument("--notes", help="the reasoning behind the proposal")
+    p.add_argument("--force", action="store_true",
+                   help="reopen a week that is already locked")
+    p.set_defaults(fn=cmd_plan_propose)
+
     p = plan.add_parser("show", help="the week's day cards", parents=[common])
     p.add_argument("week", nargs="?")
     p.set_defaults(fn=cmd_plan_show)
@@ -781,6 +882,12 @@ def build_parser():
 
     p = sub.add_parser("docs", help="print this command reference as markdown", parents=[common])
     p.set_defaults(fn=cmd_docs, group="docs", action=None)
+
+    p = sub.add_parser("check-skills", parents=[common],
+                       help="verify mh commands quoted in .claude are real")
+    p.add_argument("path", nargs="?", type=Path,
+                   help="defaults to <repo>/.claude")
+    p.set_defaults(fn=cmd_check_skills, group="check-skills", action=None)
     return ap
 
 
@@ -795,6 +902,12 @@ def main(argv=None):
     if args.group == "docs":
         print(render_reference())
         return 0
+
+    if args.group == "check-skills":
+        import check_mh_usage
+        repo = Path(args.repo or os.environ.get(
+            "MELLONHEAD_ROOT", Path.home() / "Projects" / "mellonhead")).expanduser()
+        return check_mh_usage.main([str(args.path or (repo / ".claude"))])
 
     repo = args.repo or os.environ.get(
         "MELLONHEAD_ROOT", Path.home() / "Projects" / "mellonhead")

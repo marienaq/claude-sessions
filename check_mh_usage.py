@@ -110,26 +110,29 @@ def check(command, parser):
     if bad:
         return f"no such command: `{bad}`"
 
-    # The command path is real. Only check values if enough were supplied to
-    # judge them; a bare reference has none.
-    # Match by position across all positionals, then check only the ones that
-    # constrain their value. Pairing "the first constrained argument" with
-    # "the first word" crosses `task` and `status` in `mh task status X done`.
-    slots = [a for a in leaf._actions
-             if not a.option_strings and a.dest != "help"]
+    # The command path is real. If the invocation supplies every required
+    # positional it is a prescription, so hand it to argparse, which validates
+    # choices, type converters and options far better than reimplementing them
+    # here. With fewer, it is prose naming a command and only the path matters.
+    required = [a for a in leaf._actions
+                if not a.option_strings and a.dest != "help"
+                and a.nargs not in ("?", "*")]
     supplied = [w for w in rest if not w.startswith("-")]
-    for action, word in zip(slots, supplied):
-        if not action.choices or word.startswith("<"):
-            continue
-        if word not in action.choices:
-            allowed = ", ".join(str(c) for c in action.choices)
-            return f"`{word}` is not a valid {action.dest} ({allowed})"
+    if len(supplied) < len(required):
+        # Still worth catching a misspelled option in a partial reference.
+        known = {o for a in leaf._actions for o in a.option_strings}
+        for word in rest:
+            if word.startswith("--") and word.split("=")[0] not in known:
+                return f"unknown option: `{word.split('=')[0]}`"
+        return None
 
-    # Flags are cheap to verify and a wrong one is always a real mistake.
-    known = {o for a in leaf._actions for o in a.option_strings}
-    for word in rest:
-        if word.startswith("--") and word.split("=")[0] not in known:
-            return f"unknown option: `{word.split('=')[0]}`"
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(argv)
+    except SystemExit:
+        return "not a valid mh command"
+    except Exception as exc:                     # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
     return None
 
 
