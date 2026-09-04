@@ -1225,6 +1225,122 @@ def process_pending_resumes(sessions_list, store):
     return changed
 
 
+def week_review_prompt(store, week_start):
+    """
+    The opening prompt for a conversation about a proposed week.
+
+    The proposal itself is not the point: MQ can already read the rows. What
+    she cannot see is what the job assumed, what it could not check, and
+    which rules it applied. The prompt asks for that first, and only then for
+    a decision.
+    """
+    import datetime
+
+    row = store.week(week_start) or {}
+    notes = (row.get("notes") or "").strip()
+    end = (datetime.date.fromisoformat(week_start)
+           + datetime.timedelta(days=6)).isoformat()
+    rows = store.conn.execute(
+        """SELECT * FROM tasks WHERE planned_day >= ? AND planned_day <= ?
+           ORDER BY planned_day, seq IS NULL, seq, id""",
+        (week_start, end)).fetchall()
+
+    lines = [
+        f"I want to review the proposed week of {week_start} before I lock it.",
+        "",
+        "Read these first, then talk to me:",
+        "",
+        f"- `./operations/mh plan show {week_start}` for the rows as they stand",
+        "- the `### Commitment Rules` section at the top of `priorities.md`",
+        "- `operations/projects-dashboard.md` for what each project has waiting",
+        "",
+        "Open by telling me, in this order and without me having to ask:",
+        "",
+        "1. **The shape of the week and why.** What each day is for, which "
+        "rules drove it, and where a rule was bent or missed.",
+        "2. **What you assumed that you could not verify.** The job has no "
+        "calendar, no Gamma, and no email or Slack beyond what is already "
+        "swept into files. Name every item whose placement depends on "
+        "something you could not check, so I can confirm or correct it.",
+        "3. **What you deliberately left out**, and why it did not make the "
+        "week.",
+        "",
+        "Then ask me for:",
+        "",
+        "- corrections to any of those assumptions",
+        "- changes in my capacity this week that you could not know about",
+        "- anything new that has to be in the week, or any project whose "
+        "priority has moved",
+        "",
+        "Work through it with me one topic at a time rather than in one long "
+        "block. As I answer, make the changes:",
+        "",
+        "```",
+        f"./operations/mh task plan <key#id> <YYYY-MM-DD> --actor orca",
+        f"./operations/mh task plan <key#id> --actor orca      # pull it out",
+        f"./operations/mh task load <key#id> deep|medium|shallow --actor orca",
+        f"./operations/mh task add <project> \"<title>\" --day <date> --actor orca",
+        "```",
+        "",
+        f"**Do not run `mh plan lock {week_start}` until I say yes in so many "
+        "words.** Proposing is yours; locking is mine. When I do say yes, "
+        "lock it and tell me what changed between the proposal and the "
+        "locked week.",
+        "",
+        f"There are {len(rows)} rows on day cards for this week.",
+    ]
+    if notes:
+        lines += ["", "The job's own reasoning, verbatim:", "", "---",
+                  notes, "---"]
+    return "\n".join(lines)
+
+
+def launch_claude_session(cwd, prompt):
+    """
+    Open an iTerm tab running `claude` with a prepared opening prompt.
+
+    The prompt goes through a file rather than the command line: it runs to
+    several thousand characters and carries quotes, backticks and newlines,
+    all of which have to survive Python, AppleScript and the shell intact.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    prompt_file = STATE_DIR / "week-review-prompt.md"
+    prompt_file.write_text(prompt)
+
+    safe_cwd = shlex.quote(cwd)
+    safe_prompt = shlex.quote(str(prompt_file))
+    command = f"cd {safe_cwd} && claude \"$(cat {safe_prompt})\""
+    escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'''
+    tell application "iTerm2"
+        if (count of windows) = 0 then
+            create window with default profile
+            tell current session of current window
+                write text "{escaped}"
+            end tell
+        else
+            tell current window
+                create tab with default profile
+                tell current session
+                    write text "{escaped}"
+                end tell
+            end tell
+        end if
+        activate
+    end tell
+    '''
+    try:
+        result = subprocess.run(["osascript", "-e", script],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            print(f"launch failed: {result.stderr}")
+            return False
+        return True
+    except Exception as exc:
+        print(f"launch error: {exc}")
+        return False
+
+
 def resume_claude_session(cwd, claude_session_id):
     """Open a new iTerm tab, cd to the given directory, and run `claude --resume <id>`."""
     safe_cwd = shlex.quote(cwd) if cwd else "~"
@@ -1828,6 +1944,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "id": task["id"]})
             except mhstore.StoreError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+
+        elif self.path == "/api/review-week":
+            body = self.read_body()
+            store = get_store()
+            week = body.get("weekStart")
+            if store is None or not week:
+                self.send_json({"ok": False, "error": "No store or week"}, 400)
+                return
+            prompt = week_review_prompt(store, week)
+            ok = launch_claude_session(str(MELLONHEAD_ROOT), prompt)
+            self.send_json({"ok": ok, "weekStart": week})
             return
 
         elif self.path == "/api/set-review":
@@ -2514,6 +2642,11 @@ body {
     margin-left: 6px;
 }
 .priorities-actions { display: flex; gap: 6px; }
+.map-btn.primary {
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+}
 .quick-add {
     font-size: 10px;
     opacity: 0.35;
@@ -3372,6 +3505,7 @@ function renderPriorities() {
         <div class="priorities-header">
             <div class="priorities-title">${escHtml(w.title || (w.isCurrent ? 'This Week' : 'Next Week'))}${suffix}</div>
             <div class="priorities-actions">
+                ${live && w.weekStart && !w.locked ? `<button class="map-btn primary" onclick="reviewWeek('${w.weekStart}')">Review with Orca</button>` : ''}
                 ${live && w.weekStart && !w.locked ? `<button class="map-btn" onclick="lockWeek('${w.weekStart}')">Lock week</button>` : ''}
                 ${showMapBtn ? '<button class="map-btn" onclick="mapPriorities()">Map to sessions</button>' : ''}
             </div>
@@ -3483,8 +3617,20 @@ async function storeAction(action, payload) {
     return res.ok;
 }
 
+async function reviewWeek(weekStart) {
+    const res = await fetch('/api/review-week', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({weekStart})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) alert('Could not open a session. Is iTerm running?');
+}
+
 async function lockWeek(weekStart) {
-    if (!confirm('Lock this week? Planned rows are committed.')) return;
+    if (!confirm('Lock this week? Planned rows are committed.\n\n' +
+                 'If you have not talked it through yet, "Review with Orca" ' +
+                 'opens a session that walks you through the assumptions first.')) return;
     await storeAction('plan/lock', {weekStart});
     fetchSessions(true);
 }

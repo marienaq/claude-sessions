@@ -158,6 +158,52 @@ class TestPrioritiesFromStore(ServerCase):
         self.assertFalse(p["weeks"][1]["isCurrent"])
 
 
+class TestWeekReview(ServerCase):
+    """
+    A proposal you cannot interrogate is just a list someone handed you. The
+    prompt has to ask for the assumptions before it asks for a decision.
+    """
+
+    def setUp(self):
+        super().setUp()
+        store = self.build_store()
+        store.add_project("proj", "A Project", dir="proj")
+        self.monday = _monday()
+        store.add_task("proj", "Proposed work", display_ord="1",
+                       planned_day=self.monday.isoformat(), status="planned")
+        store.upsert_week(self.monday.isoformat(),
+                          proposed_at="2026-09-04T13:06:00",
+                          notes="Monday is empty because it is a holiday.")
+
+    def test_prompt_asks_for_assumptions_before_a_decision(self):
+        server = self.load_server()
+        prompt = server.week_review_prompt(server.get_store(),
+                                           self.monday.isoformat())
+        for expected in ("could not verify", "capacity", "left out",
+                         "mh plan show"):
+            self.assertIn(expected, prompt, f"prompt should cover {expected!r}")
+
+    def test_prompt_forbids_locking_without_a_yes(self):
+        """Proposing is the job's; locking is MQ's."""
+        server = self.load_server()
+        prompt = server.week_review_prompt(server.get_store(),
+                                           self.monday.isoformat())
+        self.assertIn("until I say yes", prompt)
+        self.assertIn("plan lock", prompt)
+
+    def test_prompt_carries_the_reasoning_verbatim(self):
+        server = self.load_server()
+        prompt = server.week_review_prompt(server.get_store(),
+                                           self.monday.isoformat())
+        self.assertIn("Monday is empty because it is a holiday.", prompt)
+
+    def test_prompt_names_the_row_count(self):
+        server = self.load_server()
+        prompt = server.week_review_prompt(server.get_store(),
+                                           self.monday.isoformat())
+        self.assertIn("1 rows on day cards", prompt)
+
+
 class TestStoreHandle(ServerCase):
 
     def test_reopens_when_the_database_is_replaced(self):
