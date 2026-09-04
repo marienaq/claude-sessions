@@ -110,11 +110,38 @@ class TestPrioritiesFromStore(ServerCase):
         tuesday = p["weeks"][0]["days"][1]
         self.assertTrue(tuesday["items"][0]["done"])
 
-    def test_week_title_from_week_row(self):
+    def test_week_title_is_the_date_not_the_notes(self):
+        """
+        weeks.notes holds the reasoning behind a proposal; the Friday job
+        fills it with a couple of thousand words. Using it as the title
+        rendered the whole rationale as one uppercase wall across the bar.
+        """
         p = self.load_server().load_priorities()
-        self.assertEqual(p["weeks"][0]["title"], "Week of testing")
-        self.assertTrue(p["weeks"][0]["isCurrent"])
+        week = p["weeks"][0]
+        self.assertEqual(week["title"],
+                         self.monday.strftime("Week of %B %-d, %Y"))
+        self.assertEqual(week["notes"], "Week of testing",
+                         "the reasoning is still available, just not as a title")
+        self.assertTrue(week["isCurrent"])
         self.assertFalse(p["noCurrentWeek"])
+
+    def test_proposed_and_locked_are_distinct(self):
+        server = self.load_server()
+        week = server.load_priorities()["weeks"][0]
+        self.assertFalse(week["locked"])
+        self.assertFalse(week["proposed"])
+
+        self.store.conn.execute(
+            "UPDATE weeks SET proposed_at = '2026-09-04T13:06:00'")
+        week = self.load_server().load_priorities()["weeks"][0]
+        self.assertTrue(week["proposed"])
+        self.assertFalse(week["locked"])
+
+        self.store.conn.execute(
+            "UPDATE weeks SET locked_at = '2026-09-05T09:00:00'")
+        week = self.load_server().load_priorities()["weeks"][0]
+        self.assertTrue(week["locked"])
+        self.assertFalse(week["proposed"], "locked supersedes proposed")
 
     def test_blocked_listed_without_a_day(self):
         p = self.load_server().load_priorities()

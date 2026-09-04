@@ -584,14 +584,22 @@ def load_priorities():
 
     weeks = []
     for pos, start in enumerate(selected):
-        row = store.week(start.isoformat())
-        label = (row or {}).get("notes") or start.strftime("Week of %B %-d, %Y")
+        row = store.week(start.isoformat()) or {}
+        # The title is the date, always. weeks.notes holds the reasoning
+        # behind a proposal, which the Friday job fills with a couple of
+        # thousand words; using it as the heading rendered the whole
+        # rationale as one uppercase wall across the top of the bar.
+        notes = (row.get("notes") or "").strip()
+        if notes == start.strftime("%B %-d, %Y"):
+            notes = ""            # migration stored the label here
         weeks.append({
-            "title": label,
+            "title": start.strftime("Week of %B %-d, %Y"),
             "weekStart": start.isoformat(),
             "days": _week_from_store(store, start),
             "isCurrent": has_current and pos == 0,
-            "locked": bool((row or {}).get("locked_at")),
+            "locked": bool(row.get("locked_at")),
+            "proposed": bool(row.get("proposed_at") and not row.get("locked_at")),
+            "notes": notes,
         })
 
     blocked = [_priority_item(dict(r)) for r in store.conn.execute(
@@ -2469,6 +2477,35 @@ body {
     border-radius: 4px;
     background: var(--accent-dim);
 }
+.week-proposed {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-left: 6px;
+    color: var(--accent);
+    opacity: 0.85;
+}
+.week-notes {
+    font-size: 11px;
+    margin: 4px 0 8px;
+    color: var(--text-dim);
+}
+.week-notes > summary {
+    cursor: pointer;
+    opacity: 0.55;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.week-notes > div {
+    margin-top: 6px;
+    padding: 8px 10px;
+    border-left: 2px solid var(--border);
+    line-height: 1.5;
+    max-height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
 .week-locked {
     font-size: 9px;
     text-transform: uppercase;
@@ -3329,7 +3366,8 @@ function renderPriorities() {
         let suffix = '';
         if (noCurrent && idx === 0) suffix = ' <span style="opacity:0.6">· upcoming (no plan for this week)</span>';
         else if (!w.isCurrent) suffix = ' <span style="opacity:0.6">· next week</span>';
-        if (w.locked) suffix += ' <span class="week-locked">locked</span>';
+        if (w.proposed) suffix += ' <span class="week-proposed">proposed, not confirmed</span>';
+        else if (w.locked) suffix += ' <span class="week-locked">locked</span>';
         return `<div class="priorities-week">
         <div class="priorities-header">
             <div class="priorities-title">${escHtml(w.title || (w.isCurrent ? 'This Week' : 'Next Week'))}${suffix}</div>
@@ -3338,6 +3376,7 @@ function renderPriorities() {
                 ${showMapBtn ? '<button class="map-btn" onclick="mapPriorities()">Map to sessions</button>' : ''}
             </div>
         </div>
+        ${w.notes ? `<details class="week-notes"><summary>why this week looks like this</summary><div>${escHtml(w.notes)}</div></details>` : ''}
         <div class="priorities-days">
             ${w.days.map(d => `<div class="priority-day"
                 ${live && d.date ? `ondragover="dragOverDay(event)" ondragleave="dragLeaveDay(event)" ondrop="dropOnDay(event, '${d.date}')"` : ''}>
