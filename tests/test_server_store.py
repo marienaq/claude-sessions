@@ -7,6 +7,7 @@ a fresh fixture repo and reloads the module.
 """
 
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -202,6 +203,51 @@ class TestWeekReview(ServerCase):
         prompt = server.week_review_prompt(server.get_store(),
                                            self.monday.isoformat())
         self.assertIn("1 rows on day cards", prompt)
+
+
+class TestProposalSessionLookup(ServerCase):
+    """
+    Resuming the run that built the week beats starting fresh: the agent
+    still holds why it placed each row and what it could not check.
+    """
+
+    def _transcript(self, name, week, timestamps, proposed=True):
+        d = self.repo / "projects" / "-fake-project"
+        d.mkdir(parents=True, exist_ok=True)
+        body = []
+        if proposed:
+            body.append(json.dumps({"c": f"./operations/mh plan propose {week}"}))
+        for ts in timestamps:
+            body.append('{"timestamp":"' + ts + '"}')
+        (d / f"{name}.jsonl").write_text("\n".join(body))
+        return d
+
+    def test_picks_the_session_that_actually_proposed(self):
+        server = self.load_server()
+        d = self._transcript("built-it", "2026-09-07", ["2026-09-04T20:09:05Z"])
+        self._transcript("just-discussed-it", "2026-09-07",
+                         ["2026-09-04T21:00:00Z"], proposed=False)
+        server.CLAUDE_PROJECTS_DIR = d.parent
+        server.decode_project_dir_name = lambda root: "-fake-project"
+        self.assertEqual(server.find_proposal_session("2026-09-07"), "built-it")
+
+    def test_newest_by_transcript_time_not_file_mtime(self):
+        """Every transcript in the real directory shares one mtime."""
+        server = self.load_server()
+        d = self._transcript("older", "2026-09-07", ["2026-09-01T10:00:00Z"])
+        self._transcript("newer", "2026-09-07", ["2026-09-04T20:09:05Z"])
+        for f in d.glob("*.jsonl"):
+            os.utime(f, (1_800_000_000, 1_800_000_000))   # identical mtimes
+        server.CLAUDE_PROJECTS_DIR = d.parent
+        server.decode_project_dir_name = lambda root: "-fake-project"
+        self.assertEqual(server.find_proposal_session("2026-09-07"), "newer")
+
+    def test_no_match_returns_none(self):
+        server = self.load_server()
+        d = self._transcript("other-week", "2026-09-07", ["2026-09-04T20:00:00Z"])
+        server.CLAUDE_PROJECTS_DIR = d.parent
+        server.decode_project_dir_name = lambda root: "-fake-project"
+        self.assertIsNone(server.find_proposal_session("2026-12-14"))
 
 
 class TestStoreHandle(ServerCase):

@@ -1225,7 +1225,57 @@ def process_pending_resumes(sessions_list, store):
     return changed
 
 
-def week_review_prompt(store, week_start):
+PROPOSAL_MARKER = "Weekly proposal (Friday 1pm, unattended)"
+
+
+def find_proposal_session(week_start, max_age_days=14):
+    """
+    The transcript of the run that built this week, if it is still on disk.
+
+    Resuming it beats starting fresh: the agent still holds why it placed
+    each row, what it could not check, and what it left out.
+
+    Identified by evidence that it actually proposed this week, not by the
+    prompt text alone — a conversation that merely discussed the job matches
+    that. File mtimes are unreliable here (they get bulk-touched, and every
+    transcript in this directory currently shares one), so ordering comes
+    from the last timestamp inside each transcript.
+    """
+    import time
+
+    project_dir = CLAUDE_PROJECTS_DIR / decode_project_dir_name(MELLONHEAD_ROOT)
+    if not project_dir.exists():
+        return None
+    cutoff = time.time() - max_age_days * 86400
+    hits = []
+    for path in project_dir.glob("*.jsonl"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        # It proposed this week if it ran the command that does so.
+        if f"plan propose {week_start}" not in text:
+            continue
+        last = ""
+        for line in text.splitlines():
+            marker = '"timestamp":"'
+            at = line.find(marker)
+            if at != -1:
+                last = max(last, line[at + len(marker):at + len(marker) + 24])
+        hits.append((last, path.stem))
+    if not hits:
+        return None
+    return sorted(hits, reverse=True)[0][1]
+
+
+def decode_project_dir_name(root):
+    """~/Projects/mellonhead -> -Users-mariena-Projects-mellonhead"""
+    return str(root).replace("/", "-")
+
+
+def week_review_prompt(store, week_start, resuming=False):
     """
     The opening prompt for a conversation about a proposed week.
 
@@ -1248,12 +1298,25 @@ def week_review_prompt(store, week_start):
     lines = [
         f"I want to review the proposed week of {week_start} before I lock it.",
         "",
-        "Read these first, then talk to me:",
-        "",
-        f"- `./operations/mh plan show {week_start}` for the rows as they stand",
-        "- the `### Commitment Rules` section at the top of `priorities.md`",
-        "- `operations/projects-dashboard.md` for what each project has waiting",
-        "",
+    ]
+    if resuming:
+        lines += [
+            "You built this proposal earlier in this session, so you still "
+            "have your own reasoning. Re-read the current rows with "
+            f"`./operations/mh plan show {week_start}` in case anything moved, "
+            "then talk to me.",
+            "",
+        ]
+    else:
+        lines += [
+            "Read these first, then talk to me:",
+            "",
+            f"- `./operations/mh plan show {week_start}` for the rows as they stand",
+            "- the `### Commitment Rules` section at the top of `priorities.md`",
+            "- `operations/projects-dashboard.md` for what each project has waiting",
+            "",
+        ]
+    lines += [
         "Open by telling me, in this order and without me having to ask:",
         "",
         "1. **The shape of the week and why.** What each day is for, which "
@@ -1289,13 +1352,13 @@ def week_review_prompt(store, week_start):
         "",
         f"There are {len(rows)} rows on day cards for this week.",
     ]
-    if notes:
+    if notes and not resuming:
         lines += ["", "The job's own reasoning, verbatim:", "", "---",
                   notes, "---"]
     return "\n".join(lines)
 
 
-def launch_claude_session(cwd, prompt):
+def launch_claude_session(cwd, prompt, resume_id=None):
     """
     Open an iTerm tab running `claude` with a prepared opening prompt.
 
@@ -1309,7 +1372,11 @@ def launch_claude_session(cwd, prompt):
 
     safe_cwd = shlex.quote(cwd)
     safe_prompt = shlex.quote(str(prompt_file))
-    command = f"cd {safe_cwd} && claude \"$(cat {safe_prompt})\""
+    if resume_id:
+        command = (f"cd {safe_cwd} && claude --resume {shlex.quote(resume_id)} "
+                   f"\"$(cat {safe_prompt})\"")
+    else:
+        command = f"cd {safe_cwd} && claude \"$(cat {safe_prompt})\""
     escaped = command.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
     tell application "iTerm2"
@@ -1953,9 +2020,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if store is None or not week:
                 self.send_json({"ok": False, "error": "No store or week"}, 400)
                 return
-            prompt = week_review_prompt(store, week)
-            ok = launch_claude_session(str(MELLONHEAD_ROOT), prompt)
-            self.send_json({"ok": ok, "weekStart": week})
+            session_id = find_proposal_session(week)
+            prompt = week_review_prompt(store, week, resuming=bool(session_id))
+            ok = launch_claude_session(str(MELLONHEAD_ROOT), prompt,
+                                       resume_id=session_id)
+            self.send_json({"ok": ok, "weekStart": week,
+                            "resumed": session_id})
             return
 
         elif self.path == "/api/set-review":
