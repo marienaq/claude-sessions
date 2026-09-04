@@ -139,6 +139,40 @@ class TestInlineFrontEnd(unittest.TestCase):
         # A bare renderAll() after a write must still redraw everything.
         self.assertIn("!changed", render)
 
+    def test_automation_runs_are_hidden_by_default(self):
+        """
+        The scheduled jobs run every two hours and leave a card each time,
+        titled with a bare timestamp. They outnumbered real conversations on
+        the board.
+        """
+        js = "\n".join(self._scripts())
+        block = js[js.index("function getFilteredSessions"):]
+        block = block[:block.index("\n}")]
+        self.assertIn("isAutomation", block)
+        self.assertIn("showAutomation", block)
+        self.assertIn("!search", block,
+                      "a search must still reach a hidden run")
+
+    def test_automation_detection_matches_the_prompt_convention(self):
+        """
+        Matched against the raw transcript, not the parsed first message:
+        these prompts run to thousands of characters and the first-message
+        regex only captures short ones, so it picks up a later line instead.
+        """
+        import server
+        cases = {
+            b'# Scheduled capture sweep': True,
+            b'# Scheduled /do-work sweep': True,
+            b'# Weekly proposal (Friday 1pm, unattended)': True,
+            b'# Nightly Notion sync (leads only)': True,
+            b'Post exactly this to Slack #agent-errors': True,
+            b'I want to revisit the learning arc for AI champions': False,
+            b'# Scheduling the workshop with Sharla': False,
+        }
+        for text, expected in cases.items():
+            got = bool(server.AUTOMATION_PROMPT.search(text))
+            self.assertEqual(got, expected, f"{text!r} -> {got}")
+
     def test_every_onclick_handler_exists(self):
         """
         An onclick naming a function that was renamed away throws at click

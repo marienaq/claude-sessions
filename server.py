@@ -943,6 +943,19 @@ _AI_TITLE_RE = re.compile(rb'"aiTitle"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _USER_MSG_RE = re.compile(
     rb'"type"\s*:\s*"user"[^\n]{0,2000}?"content"\s*:\s*"((?!<)[^"\\<{][^"\\<]{3,150})"[^\n]*?"userType"\s*:\s*"external"'
 )
+# The unattended jobs all open with a prompt whose first line names them:
+# "# Scheduled capture sweep", "# Weekly proposal (Friday 1pm, unattended)",
+# and so on, plus the one-line Slack posts. Matching the convention rather
+# than a list means a new job added later is recognised without a code change.
+# Matched against the raw opening of the transcript rather than the parsed
+# first user message: these prompts run to thousands of characters and the
+# first-message regex only captures short ones, so it picks up a later line
+# instead. That is also why these cards are titled with a bare timestamp.
+AUTOMATION_PROMPT = re.compile(
+    rb"# (?:Scheduled [\w/ -]+ sweep|Nightly [\w ]+|Weekly proposal"
+    rb"|Unattended [\w ]+)|Post exactly this", re.I)
+
+
 # Cache of (mtime -> {cwd, title, firstMessage}) keyed by jsonl path
 _JSONL_META_CACHE = {}
 
@@ -964,6 +977,7 @@ def extract_jsonl_metadata(jsonl_path, mtime):
     cwd = ""
     title = ""
     first_msg = ""
+    is_automation = False
     try:
         with open(jsonl_path, "rb") as f:
             chunk = f.read(131072)  # 128KB — cwd is in line 1-3, ai-title within first few turns
@@ -973,6 +987,10 @@ def extract_jsonl_metadata(jsonl_path, mtime):
         # ai-title may appear multiple times; take the last one in our window (most recent)
         for m in _AI_TITLE_RE.finditer(chunk):
             title = _decode_json_str(m.group(1))
+        # Look for the job's own prompt in the opening of the transcript.
+        # Bounded to the first 32KB so a later mention in a human
+        # conversation about the automation is not mistaken for a run of it.
+        is_automation = bool(AUTOMATION_PROMPT.search(chunk[:32768]))
         # First user message (fallback when ai-title hasn't been generated yet)
         if not title:
             m = _USER_MSG_RE.search(chunk)
@@ -980,7 +998,8 @@ def extract_jsonl_metadata(jsonl_path, mtime):
                 first_msg = _decode_json_str(m.group(1))[:80]
     except OSError:
         pass
-    meta = {"mtime": mtime, "cwd": cwd, "title": title, "firstMessage": first_msg}
+    meta = {"mtime": mtime, "cwd": cwd, "title": title,
+            "firstMessage": first_msg, "isAutomation": is_automation}
     _JSONL_META_CACHE[jsonl_path] = meta
     return meta
 
@@ -1043,6 +1062,7 @@ def discover_inactive_sessions(active_claude_ids):
                 "cwd": cwd,
                 "title": meta["title"],
                 "firstMessage": meta["firstMessage"],
+                "isAutomation": meta.get("isAutomation", False),
                 "lastActivity": st.st_mtime,
                 "jsonlPath": str(jsonl),
             })
@@ -1118,6 +1138,7 @@ def build_inactive_card(inactive, store):
         "startedAt": int(inactive["lastActivity"] * 1000),
         "uptime": age_str,
         "isActive": False,
+        "isAutomation": inactive.get("isAutomation", False),
         "isInactive": True,
         "cardState": "inactive",
         "colorGroup": "default",
@@ -2534,6 +2555,19 @@ body {
     align-items: center;
     gap: 8px;
 }
+.automation-toggle {
+    display: inline-block;
+    font-size: 10px;
+    padding: 2px 8px;
+    margin-left: 6px;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    color: var(--text-dim);
+    opacity: 0.6;
+    cursor: pointer;
+    user-select: none;
+}
+.automation-toggle:hover { opacity: 1; border-color: var(--accent); color: var(--accent); }
 .filter-tag {
     display: inline-flex;
     align-items: center;
@@ -3403,6 +3437,7 @@ let colorGroups = {};
 let priorities = {};
 let panels = {available: false, backlog: [], proposed: [], projects: []};
 let activeFilterTag = null;
+let showAutomation = localStorage.getItem('showAutomation') === '1';
 let tagInputTarget = null;
 let isEditing = false;
 const expandedSections = new Set();
@@ -3494,6 +3529,12 @@ function togglePriorityItemFromEl(el) {
     });
 }
 
+function toggleAutomation() {
+    showAutomation = !showAutomation;
+    try { localStorage.setItem('showAutomation', showAutomation ? '1' : '0'); } catch (e) {}
+    renderAll();
+}
+
 function setFilter(tag) {
     activeFilterTag = (activeFilterTag === tag) ? null : tag;
     renderAll();
@@ -3507,6 +3548,14 @@ function clearFilter() {
 function getFilteredSessions() {
     let filtered = sessions;
     const search = document.getElementById('searchInput')?.value?.toLowerCase() || '';
+
+    // The unattended jobs run every two hours and leave a card each time,
+    // titled with a bare timestamp. They outnumber real conversations and
+    // push them off screen, so they are hidden unless asked for. A search
+    // still reaches them: if you are looking for a sweep by name, you want it.
+    if (!showAutomation && !search) {
+        filtered = filtered.filter(s => !s.isAutomation);
+    }
 
     if (activeFilterTag) {
         filtered = filtered.filter(s =>
@@ -3776,14 +3825,22 @@ function renderTagCloudInline() {
     }).join('');
 }
 
+function automationToggleHtml() {
+    const n = sessions.filter(s => s.isAutomation).length;
+    if (!n) return '';
+    return `<span class="automation-toggle" onclick="toggleAutomation()"
+        title="Scheduled runs: capture sweeps, /do-work, the Friday proposal, the nightly check">
+        ${showAutomation ? '&#10003; ' : ''}${n} automated run${n === 1 ? '' : 's'}
+        ${showAutomation ? '' : '&middot; show'}</span>`;
+}
+
 function renderFilterBar() {
     const el = document.getElementById('activeFilter');
-    if (activeFilterTag) {
-        el.innerHTML = `<span class="filter-tag">${activeFilterTag}
-            <span class="clear" onclick="clearFilter()">×</span></span>`;
-    } else {
-        el.innerHTML = '';
-    }
+    const tag = activeFilterTag
+        ? `<span class="filter-tag">${activeFilterTag}
+            <span class="clear" onclick="clearFilter()">×</span></span>`
+        : '';
+    el.innerHTML = tag + automationToggleHtml();
 }
 
 function renderCards() {
