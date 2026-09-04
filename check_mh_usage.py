@@ -180,14 +180,22 @@ def main(argv=None):
                 rel = path.relative_to(root) if root.is_dir() else path.name
                 problems.append((rel, number, command, reason))
 
+    where = root if root.is_dir() else root.parent
     if not problems:
+        if total == 0:
+            # A clean zero and a real pass read identically at a glance, and
+            # scanning the wrong directory is the likeliest cause. Say so.
+            print(f"no mh commands found in {where}")
+            print("Nothing was checked. If that is unexpected, the path is "
+                  "probably wrong: pass one explicitly, or set MELLONHEAD_ROOT.")
+            return 0
         if not args.quiet:
             print(f"checked {total} mh invocation(s) across {len(files)} "
-                  f"file(s): all valid")
+                  f"file(s) in {where}: all valid")
         return 0
 
-    print(f"{len(problems)} of {total} mh invocation(s) are not valid "
-          f"commands:\n")
+    print(f"{len(problems)} of {total} mh invocation(s) in {where} are not "
+          f"valid commands:\n")
     for rel, number, command, reason in problems:
         print(f"  {rel}:{number}")
         print(f"    {command}")
