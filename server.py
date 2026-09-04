@@ -10,16 +10,38 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 import urllib.parse
 from pathlib import Path
 
-PORT = 7433
-SESSIONS_FILE = Path.home() / ".claude-manager" / "sessions.json"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import mhstore
+    import mhgen
+except ImportError:                     # store not installed; markdown only
+    mhstore = None
+    mhgen = None
+
+# Everything below can be pointed at a scratch copy so a dev instance never
+# touches live state. See operations/prioritization-implementation-plan.md 5.7.
+#   MELLONHEAD_ROOT  the content repo to read (priorities.md, task lists, store)
+#   CSM_STATE_DIR    session-manager state (sessions.json, todos/)
+#   CSM_PORT         listen port; --port on the command line wins
+PORT = int(os.environ.get("CSM_PORT", "7433"))
+MELLONHEAD_ROOT = Path(
+    os.environ.get("MELLONHEAD_ROOT", Path.home() / "Projects" / "mellonhead")
+).expanduser()
+STATE_DIR = Path(
+    os.environ.get("CSM_STATE_DIR", Path.home() / ".claude-manager")
+).expanduser()
+
+SESSIONS_FILE = STATE_DIR / "sessions.json"
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-PRIORITIES_FILE = Path.home() / "Projects" / "mellonhead" / "priorities.md"
-TODOS_DIR = Path.home() / ".claude-manager" / "todos"
+PRIORITIES_FILE = MELLONHEAD_ROOT / "priorities.md"
+STORE_FILE = MELLONHEAD_ROOT / "operations" / "tasks.db"
+TODOS_DIR = STATE_DIR / "todos"
 TODOS_INDEX = TODOS_DIR / "index.json"
 INACTIVE_WINDOW_DAYS = 30
 INACTIVE_MAX = 200
@@ -31,6 +53,94 @@ STATE_CATEGORIES = (
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# The task store
+#
+# The store is the record. The markdown readers below it are kept as a
+# fallback for the dual-live window and for a rollback: if tasks.db is absent
+# or holds no week, the dashboard still renders from priorities.md rather than
+# going blank. See the plan's cutover steps 4 and 6.
+# ---------------------------------------------------------------------------
+
+_STORE = None
+_STORE_FILE_ID = None
+
+
+def get_store():
+    """
+    Open the store once per process, and reopen it if the file underneath has
+    been replaced.
+
+    A long-lived handle keeps writing to the old inode after tasks.db is
+    swapped out — by a restore, a migration that recreates it, or a rebuilt
+    working copy. SQLite reports success, the audit log records the write
+    because it reopens by path, and the row never changes. Three checkbox
+    clicks were lost that way, with an audit trail saying they happened.
+    """
+    global _STORE, _STORE_FILE_ID
+    if mhstore is None:
+        return None
+    try:
+        info = STORE_FILE.stat()
+        file_id = (info.st_dev, info.st_ino)
+    except OSError:
+        return None
+
+    if _STORE is not None and _STORE_FILE_ID != file_id:
+        print("tasks.db was replaced underneath us; reopening")
+        try:
+            _STORE.close()
+        except Exception:
+            pass
+        _STORE = None
+
+    if _STORE is None:
+        try:
+            _STORE = mhstore.open_store(root=MELLONHEAD_ROOT,
+                                        seed_settings=False)
+            _STORE_FILE_ID = file_id
+        except Exception as exc:
+            print(f"store unavailable, falling back to markdown: {exc}")
+            return None
+    return _STORE
+
+
+def store_is_live():
+    """True when the store holds a week worth rendering."""
+    store = get_store()
+    if store is None:
+        return False
+    try:
+        return bool(store.conn.execute(
+            "SELECT 1 FROM tasks WHERE planned_day IS NOT NULL LIMIT 1"
+        ).fetchone())
+    except Exception:
+        return False
+
+
+def regenerate_views(project_keys=()):
+    """
+    Invariant 4: a write regenerates the views it affects, in the same call.
+
+    The CLI already did this; the dashboard did not, so a checkbox updated the
+    store and left task-list.md stale. `mh verify` caught three files that way.
+    Measured at about 4ms for a task list, priorities.md and the dashboard
+    together, which is far too cheap to skip.
+
+    Never let a generation failure break the write that already succeeded.
+    """
+    store = get_store()
+    if store is None or mhgen is None:
+        return
+    try:
+        for key in {k for k in project_keys if k and k != mhstore.ONE_OFF}:
+            mhgen.generate_task_list(store, MELLONHEAD_ROOT, key)
+        mhgen.generate_priorities(store, MELLONHEAD_ROOT)
+        mhgen.generate_dashboard(store, MELLONHEAD_ROOT)
+    except Exception as exc:
+        print(f"regeneration failed after a write: {exc}")
+
 
 def load_store():
     if SESSIONS_FILE.exists():
@@ -163,6 +273,80 @@ def find_task_list(cwd):
             except PermissionError:
                 continue
     return None
+
+
+def project_for_cwd(cwd):
+    """
+    The store project whose directory contains `cwd`, deepest match first.
+
+    Replaces walking the filesystem for a task-list.md: the store knows which
+    directory belongs to which project.
+    """
+    store = get_store()
+    if store is None or not cwd:
+        return None
+    try:
+        target = Path(cwd).resolve()
+    except OSError:
+        return None
+
+    # A dev instance runs against a copy of the repo while the sessions
+    # themselves are still working in the real one, so no cwd would ever match
+    # a project directory. CSM_CWD_ALIAS="<live>:<copy>" rewrites the prefix so
+    # the panel can be exercised before cutover. Unset in production.
+    alias = os.environ.get("CSM_CWD_ALIAS", "")
+    if ":" in alias:
+        src, _, dst = alias.partition(":")
+        src, dst = src.rstrip("/"), dst.rstrip("/")
+        if str(target) == src or str(target).startswith(src + os.sep):
+            target = Path(dst + str(target)[len(src):])
+    best, best_len = None, -1
+    for project in store.projects():
+        if not project["dir"]:
+            continue
+        base = (MELLONHEAD_ROOT / project["dir"]).resolve()
+        if target == base or str(target).startswith(str(base) + os.sep):
+            if len(str(base)) > best_len:
+                best, best_len = project, len(str(base))
+    return best
+
+
+def task_list_from_store(project_key):
+    """The task panel's payload, read from the store instead of markdown."""
+    store = get_store()
+    if store is None:
+        return None
+    project = store.project(project_key)
+    if project is None:
+        return None
+    rows = store.tasks(project_key=project_key)
+    result = {
+        "file": str(MELLONHEAD_ROOT / project["dir"]) if project["dir"] else "",
+        "projectKey": project["key"],
+        "projectName": project["name"],
+        "notionProjectId": project["notion_project_id"] or "",
+        "status": project["status"],
+        "source": "store",
+        "tasks": [{
+            "id": row["id"],
+            "number": row["display_ord"] or row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "statusRaw": row["status_raw"] or row["status"],
+            "notionTaskId": row["notion_task_id"] or "",
+            "notes": row["notes"] or "",
+            "notePath": row["note_path"],
+            "owner": row["owner"],
+            "seq": row["seq"],
+            "due": row["due"],
+            "section": row["section"],
+        } for row in rows],
+    }
+    nxt = store.next_task(project_key)
+    if nxt:
+        result["nextStep"] = next(
+            (t for t in result["tasks"] if t["id"] == nxt["id"]), None)
+    return result
 
 
 def parse_task_list(path):
@@ -315,10 +499,171 @@ def _parse_week_section(content, match):
     return days, blocked
 
 
+DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+             "Saturday", "Sunday")
+
+
+def _week_start_for(day):
+    """The Monday on or before `day`."""
+    import datetime
+    return day - datetime.timedelta(days=day.weekday())
+
+
+def _priority_item(task):
+    """One day-card line, in the shape the front end already renders."""
+    tag = (f"{task['project_key']}#{task['display_ord']}"
+           if task["display_ord"] else None)
+    return {
+        "id": task["id"],
+        "text": task["title"],
+        "done": task["status"] == "done",
+        "key": tag,
+        "project": task["project_key"],
+        "load": task["load"],
+        "owner": task["owner"],
+        "notePath": task["note_path"],
+    }
+
+
+def _week_from_store(store, week_start):
+    """Day cards for one week, Monday first, empty days dropped."""
+    import datetime
+    rows = store.conn.execute(
+        """SELECT * FROM tasks
+           WHERE planned_day >= ? AND planned_day <= date(?, '+6 day')
+           ORDER BY planned_day, seq IS NULL, seq, id""",
+        (week_start.isoformat(), week_start.isoformat())).fetchall()
+    by_day = {}
+    for row in rows:
+        by_day.setdefault(row["planned_day"], []).append(dict(row))
+    days = []
+    for offset in range(7):
+        day = week_start + datetime.timedelta(days=offset)
+        items = by_day.get(day.isoformat(), [])
+        if not items:
+            continue
+        days.append({
+            "day": f"{DAY_NAMES[day.weekday()]} {day.month}/{day.day}",
+            "date": day.isoformat(),
+            "items": [_priority_item(t) for t in items],
+        })
+    return days
+
+
+def load_priorities():
+    """
+    The current and next week, read from the store.
+
+    Falls back to the markdown parser when the store has no week, so the
+    dashboard keeps working during the dual-live window.
+    """
+    import datetime
+    store = get_store()
+    if store is None or not store_is_live():
+        return parse_priorities_markdown()
+
+    today = datetime.date.today()
+    this_monday = _week_start_for(today)
+
+    planned = [r["planned_day"] for r in store.conn.execute(
+        "SELECT DISTINCT planned_day FROM tasks "
+        "WHERE planned_day IS NOT NULL ORDER BY planned_day")]
+    if not planned:
+        return parse_priorities_markdown()
+
+    starts = sorted({_week_start_for(datetime.date.fromisoformat(p))
+                     for p in planned})
+    current = [s for s in starts if s <= this_monday]
+    if current:
+        selected, has_current = [current[-1]], True
+    else:
+        selected, has_current = [starts[0]], False
+    following = [s for s in starts if s > selected[0]]
+    if following:
+        selected.append(following[0])
+
+    weeks = []
+    for pos, start in enumerate(selected):
+        row = store.week(start.isoformat())
+        label = (row or {}).get("notes") or start.strftime("Week of %B %-d, %Y")
+        weeks.append({
+            "title": label,
+            "weekStart": start.isoformat(),
+            "days": _week_from_store(store, start),
+            "isCurrent": has_current and pos == 0,
+            "locked": bool((row or {}).get("locked_at")),
+        })
+
+    blocked = [_priority_item(dict(r)) for r in store.conn.execute(
+        "SELECT * FROM tasks WHERE status = 'waiting' AND planned_day IS NULL "
+        "ORDER BY project_key, id")]
+
+    return {
+        "weekTitle": weeks[0]["title"],
+        "days": weeks[0]["days"],
+        "blocked": blocked,
+        "weeks": weeks,
+        "noCurrentWeek": not has_current,
+        "source": "store",
+    }
+
+
+def obsidian_url(rel_path):
+    """
+    obsidian:// link for a repo-relative file, so a note opens somewhere it
+    can be edited rather than read-only in a browser.
+    """
+    if not rel_path:
+        return None
+    target = MELLONHEAD_ROOT / rel_path
+    return "obsidian://open?path=" + urllib.parse.quote(str(target), safe="")
+
+
+def load_panels():
+    """Backlog, unconfirmed proposals, and the per-project next action."""
+    store = get_store()
+    if store is None or not store_is_live():
+        return {"backlog": [], "proposed": [], "projects": [], "available": False}
+
+    backlog, proposed = [], []
+    for row in store.conn.execute(
+            "SELECT * FROM tasks WHERE status = 'backlog' AND planned_day IS NULL "
+            "ORDER BY project_key, seq IS NULL, seq, id"):
+        item = _priority_item(dict(row))
+        (backlog if row["confirmed"] else proposed).append(item)
+
+    projects = []
+    for project in store.projects():
+        if project["status"] not in ("active", "waiting"):
+            continue
+        if project["key"] == mhstore.ONE_OFF:
+            continue
+        nxt = store.next_task(project["key"])
+        open_count = len([t for t in store.tasks(project_key=project["key"],
+                                                 open_only=True)])
+        projects.append({
+            "key": project["key"],
+            "name": project["name"],
+            "status": project["status"],
+            "due": project["due"],
+            "openCount": open_count,
+            "next": _priority_item(nxt) if nxt else None,
+            "notePath": obsidian_url(nxt["note_path"]) if nxt and nxt["note_path"] else None,
+        })
+    projects.sort(key=lambda p: (p["status"] != "active", p["key"]))
+    return {"backlog": backlog, "proposed": proposed, "projects": projects,
+            "available": True}
+
+
 def parse_priorities():
+    """Entry point used by the handlers. Store first, markdown as a fallback."""
+    return load_priorities()
+
+
+def parse_priorities_markdown():
     """Parse priorities.md to extract daily goals for current + next week."""
     if not PRIORITIES_FILE.exists():
-        return {"days": [], "blocked": [], "weeks": []}
+        return {"days": [], "blocked": [], "weeks": [], "source": "markdown"}
 
     with open(PRIORITIES_FILE) as f:
         content = f.read()
@@ -329,7 +674,7 @@ def parse_priorities():
     # headers look like `**Week of Aug 3, 2026**` or `... 2026** -- suffix`.
     week_matches = [m for m in week_matches if not m.group(1).rstrip().endswith(":")]
     if not week_matches:
-        return {"days": [], "blocked": [], "weeks": []}
+        return {"days": [], "blocked": [], "weeks": [], "source": "markdown"}
 
     import datetime
     today = datetime.date.today()
@@ -377,6 +722,7 @@ def parse_priorities():
         "blocked": all_blocked,
         "weeks": weeks,
         "noCurrentWeek": not has_current,
+        "source": "markdown",
     }
 
 
@@ -387,7 +733,19 @@ def get_today_day_name():
 
 
 def match_priority_to_session(item, session, task_assignments):
-    """Match a priority item to a session. Prefer Notion ID; fall back to fuzzy."""
+    """
+    Match a priority item to a session.
+
+    The store gives every row a project, so a day-card line and a session
+    working in that project's directory match exactly. That runs before the
+    Notion id and well before the keyword guess below it.
+    """
+    project_key = item.get("project")
+    if project_key and project_key != "one-off":
+        session_project = (session.get("taskList") or {}).get("projectKey")
+        if session_project:
+            return session_project == project_key
+
     notion_id = item.get("notionTaskId", "")
 
     if notion_id:
@@ -976,17 +1334,26 @@ def get_all_sessions():
             pass  # Explicitly unlinked, skip auto-discovery
         elif linked_task_file and Path(linked_task_file).exists():
             try:
-                task_list = parse_task_list(Path(linked_task_file))
+                # An explicit link points at a markdown file; resolve it to
+                # the owning project so the panel still reads from the store.
+                linked = project_for_cwd(str(Path(linked_task_file).parent))
+                task_list = (task_list_from_store(linked["key"]) if linked
+                             else None) or parse_task_list(Path(linked_task_file))
             except Exception as e:
                 print(f"Task parse error for {linked_task_file}: {e}")
         else:
-            task_file = find_task_list(cwd) if cwd else None
-            if task_file:
-                try:
-                    task_list = parse_task_list(task_file)
-                    is_auto_linked = True
-                except Exception as e:
-                    print(f"Task parse error for {task_file}: {e}")
+            project = project_for_cwd(cwd) if cwd else None
+            if project:
+                task_list = task_list_from_store(project["key"])
+                is_auto_linked = task_list is not None
+            if task_list is None:
+                task_file = find_task_list(cwd) if cwd else None
+                if task_file:
+                    try:
+                        task_list = parse_task_list(task_file)
+                        is_auto_linked = True
+                    except Exception as e:
+                        print(f"Task parse error for {task_file}: {e}")
 
         # Auto tags
         auto = auto_tags_from_path(cwd) if cwd else []
@@ -1183,10 +1550,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({
                 "sessions": get_all_sessions(),
                 "priorities": parse_priorities(),
+                "panels": load_panels(),
                 "colorGroups": store.get("color_groups", {}),
             })
         elif self.path == "/api/task-files":
             files = []
+            # Sessions almost always run at the repo root rather than inside a
+            # project, so linking is how a session gets a project, not
+            # discovery. Offer the store's registered projects first: they
+            # carry status and open counts, and rglob over ~/Projects returns
+            # archived and unregistered lists indiscriminately.
+            store = get_store()
+            if store is not None and store_is_live():
+                for project in store.projects():
+                    if project["key"] == mhstore.ONE_OFF:
+                        continue
+                    if project["status"] in mhstore.ARCHIVED_PROJECT_STATUSES:
+                        continue
+                    open_count = len(store.tasks(project_key=project["key"],
+                                                 open_only=True))
+                    path = (MELLONHEAD_ROOT / project["dir"] / "task-list.md"
+                            if project["dir"] else MELLONHEAD_ROOT)
+                    files.append({
+                        "path": str(path),
+                        "shortPath": f"{project['key']}  ({open_count} open)",
+                        "projectName": project["name"],
+                        "projectKey": project["key"],
+                        "status": project["status"],
+                    })
+                files.sort(key=lambda f: (f["status"] != "active", f["projectKey"]))
+                self.send_json(files)
+                return
+
             projects = Path.home() / "Projects"
             if projects.exists():
                 for tf in projects.rglob("task-list.md"):
@@ -1293,6 +1688,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_body()
             text = body.get("text", "").strip()
             done = body.get("done", False)
+            task_id = body.get("id")
+
+            # The store path is exact: the checkbox carries the task's id, so
+            # there is no text matching and no ambiguity when two day-card
+            # lines read alike.
+            store = get_store()
+            if task_id is not None and store is not None:
+                try:
+                    task = store.task(int(task_id))
+                except (TypeError, ValueError):
+                    task = None
+                if task is None:
+                    self.send_json({"ok": False, "error": "No such task"}, 404)
+                    return
+                if done:
+                    store.complete_task(task["id"], actor="mq")
+                else:
+                    store.reopen_task(task["id"], actor="mq",
+                                      status="planned" if task["planned_day"]
+                                      else "backlog")
+                regenerate_views([task["project_key"]])
+                self.send_json({"ok": True, "id": task["id"]})
+                return
+
             if text and PRIORITIES_FILE.exists():
                 with open(PRIORITIES_FILE) as f:
                     content = f.read()
@@ -1316,6 +1735,91 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "Line not found"}, 400)
             else:
                 self.send_json({"ok": False}, 400)
+            return
+
+        # -------------------------------------------------------------
+        # Store write paths (2.4). Everything here addresses a row by id,
+        # so nothing depends on matching the text of a line.
+        # -------------------------------------------------------------
+        elif self.path.startswith("/api/task/") or self.path.startswith("/api/plan/"):
+            body = self.read_body()
+            store = get_store()
+            if store is None:
+                self.send_json({"ok": False, "error": "No store"}, 503)
+                return
+            action = self.path.rsplit("/", 1)[-1]
+
+            def wanted_task():
+                try:
+                    return store.task(int(body.get("id")))
+                except (TypeError, ValueError):
+                    return None
+
+            try:
+                if action == "add":
+                    title = (body.get("title") or "").strip()
+                    project_key = body.get("projectKey") or mhstore.ONE_OFF
+                    if not title:
+                        self.send_json({"ok": False, "error": "No title"}, 400)
+                        return
+                    if not store.project(project_key):
+                        self.send_json({"ok": False,
+                                        "error": f"No project {project_key}"}, 404)
+                        return
+                    task = store.add_task(
+                        project_key, title, actor="mq", source="manual",
+                        status="planned" if body.get("plannedDay") else "backlog",
+                        planned_day=body.get("plannedDay"),
+                        load=body.get("load"), due=body.get("due"))
+                    regenerate_views([project_key])
+                    self.send_json({"ok": True, "id": task["id"]})
+                    return
+
+                if action == "lock":
+                    # A week, not a task: no id to look up.
+                    week_start = body.get("weekStart")
+                    if not week_start:
+                        self.send_json({"ok": False, "error": "No week"}, 400)
+                        return
+                    store.lock_week(week_start, actor="mq")
+                    regenerate_views(
+                        {t["project_key"] for t in store.tasks() if t["planned_day"]})
+                    self.send_json({"ok": True, "weekStart": week_start})
+                    return
+
+                task = wanted_task()
+                if task is None:
+                    self.send_json({"ok": False, "error": "No such task"}, 404)
+                    return
+
+                if action == "plan":
+                    day = body.get("day")
+                    if day:
+                        store.plan_task(task["id"], day, actor="mq")
+                    else:
+                        store.unplan_task(task["id"], actor="mq")
+                elif action == "done":
+                    store.complete_task(task["id"], actor="mq")
+                elif action == "reopen":
+                    store.reopen_task(
+                        task["id"], actor="mq",
+                        status="planned" if task["planned_day"] else "backlog")
+                elif action == "confirm":
+                    store.confirm_task(task["id"], actor="mq")
+                elif action == "dismiss":
+                    # A proposal MQ does not want. Cancelled, not deleted:
+                    # the row and its audit line stay.
+                    store.update_task(task["id"], actor="mq", status="canceled")
+                elif action == "load":
+                    store.update_task(task["id"], actor="mq",
+                                      load=body.get("load") or None)
+                else:
+                    self.send_json({"ok": False, "error": "Unknown action"}, 404)
+                    return
+                regenerate_views([task["project_key"]])
+                self.send_json({"ok": True, "id": task["id"]})
+            except mhstore.StoreError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
             return
 
         elif self.path == "/api/set-review":
@@ -1449,6 +1953,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_body()
             task_file = body.get("taskFile", "").strip()
             task_number = body.get("taskNumber", 0)
+
+            # Same single close path as the checkbox: one write, by id.
+            store = get_store()
+            task_id = body.get("id")
+            if task_id is not None and store is not None:
+                try:
+                    task = store.task(int(task_id))
+                except (TypeError, ValueError):
+                    task = None
+                if task is None:
+                    self.send_json({"ok": False, "error": "No such task"}, 404)
+                    return
+                store.complete_task(task["id"], actor="mq")
+                nxt = store.next_task(task["project_key"])
+                regenerate_views([task["project_key"]])
+                self.send_json({"ok": True, "id": task["id"],
+                                "next": nxt["title"] if nxt else None})
+                return
+
             if task_file and task_number:
                 expanded = str(Path(task_file).expanduser())
                 if Path(expanded).exists():
@@ -1476,6 +1999,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_body()
             task_file = body.get("taskFile", "").strip()
             title = body.get("title", "").strip()
+
+            store = get_store()
+            project_key = body.get("projectKey")
+            if store is not None and title and (project_key or task_file):
+                if not project_key:
+                    project = project_for_cwd(str(Path(task_file).expanduser().parent))
+                    project_key = project["key"] if project else None
+                if project_key and store.project(project_key):
+                    task = store.add_task(
+                        project_key, title, actor="mq", source="manual",
+                        status="backlog", planned_day=body.get("plannedDay"),
+                        load=body.get("load"), due=body.get("due"))
+                    self.send_json({"ok": True, "id": task["id"],
+                                    "taskNumber": task["id"],
+                                    "projectKey": project_key})
+                    return
+
             if task_file and title:
                 expanded = str(Path(task_file).expanduser())
                 if Path(expanded).exists():
@@ -1509,6 +2049,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/task-tasks":
             body = self.read_body()
             task_file = body.get("taskFile", "").strip()
+
+            project_key = body.get("projectKey")
+            if not project_key and task_file:
+                project = project_for_cwd(str(Path(task_file).expanduser().parent))
+                project_key = project["key"] if project else None
+            if project_key:
+                payload = task_list_from_store(project_key)
+                if payload is not None:
+                    self.send_json(payload)
+                    return
+
             if task_file:
                 expanded = str(Path(task_file).expanduser())
                 if Path(expanded).exists():
@@ -1909,6 +2460,99 @@ body {
     transition: all 0.15s;
 }
 .priority-check:hover { background: var(--accent-dim); color: var(--accent); transform: scale(1.2); }
+.priority-text { flex: 1; min-width: 0; }
+.priority-item[draggable="true"] { cursor: grab; }
+.priority-item[draggable="true"]:active { cursor: grabbing; }
+.priority-day.drop-target {
+    outline: 1px dashed var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+    background: var(--accent-dim);
+}
+.week-locked {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    opacity: 0.55;
+    margin-left: 6px;
+}
+.priorities-actions { display: flex; gap: 6px; }
+.quick-add {
+    font-size: 10px;
+    opacity: 0.35;
+    padding: 2px 4px;
+    margin: 2px -4px 0;
+    cursor: pointer;
+    border-radius: 4px;
+}
+.quick-add:hover { opacity: 0.9; background: var(--accent-dim); }
+.quick-add-input {
+    width: 100%;
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 4px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+}
+
+/* Backlog / Proposed / Projects panels */
+.panels-bar { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 14px; }
+.panel {
+    flex: 1 1 240px;
+    min-width: 220px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 11px;
+}
+.panel[data-empty="1"] { opacity: 0.55; }
+.panel > summary {
+    cursor: pointer;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    list-style: none;
+}
+.panel > summary::-webkit-details-marker { display: none; }
+.panel-count { opacity: 0.5; font-weight: 400; margin-left: 4px; }
+.panel-body { margin-top: 6px; max-height: 260px; overflow-y: auto; }
+.panel-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 3px 4px;
+    margin: 0 -4px;
+    border-radius: 4px;
+    line-height: 1.35;
+    cursor: grab;
+}
+.panel-item:hover { background: var(--accent-dim); }
+.panel-item-text { flex: 1; min-width: 0; }
+.panel-item-key { flex-shrink: 0; opacity: 0.45; font-size: 9px; align-self: center; }
+.panel-next { opacity: 0.75; }
+.panel-btn {
+    flex-shrink: 0;
+    font: inherit;
+    font-size: 9px;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    text-decoration: none;
+}
+.panel-btn:hover { border-color: var(--accent); color: var(--accent); }
+.panel-empty { opacity: 0.45; padding: 3px 0; }
+.priority-load {
+    flex-shrink: 0;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.5;
+    align-self: center;
+}
 
 /* Inline Tag Cloud */
 .tag-cloud-inline {
@@ -2477,6 +3121,7 @@ body {
 </div>
 
 <div id="prioritiesBar" class="priorities-bar"></div>
+<div id="panelsBar" class="panels-bar"></div>
 
 <div class="filter-bar">
     <span id="activeFilter"></span>
@@ -2516,12 +3161,16 @@ document.addEventListener('DOMContentLoaded', () => {
 let sessions = [];
 let colorGroups = {};
 let priorities = {};
+let panels = {available: false, backlog: [], proposed: [], projects: []};
 let activeFilterTag = null;
 let tagInputTarget = null;
 let isEditing = false;
 const expandedSections = new Set();
 
 const PALETTE = ['purple','green','blue','red','orange','pink','teal','yellow'];
+
+let lastPrioritiesJson = null;
+let lastPanelsJson = null;
 
 async function fetchSessions(force = false) {
     if (isEditing && !force) return;
@@ -2531,7 +3180,21 @@ async function fetchSessions(force = false) {
         sessions = data.sessions;
         colorGroups = data.colorGroups || {};
         priorities = data.priorities || {};
-        renderAll();
+        panels = data.panels || {available: false, backlog: [], proposed: [], projects: []};
+
+        // The poll exists for the session cards, which really do change every
+        // few seconds. The priorities bar and the panels almost never do, and
+        // redrawing them anyway replaces innerHTML twelve times a minute:
+        // that is what destroyed an open quick-add box and aborted a drag.
+        // Only redraw a section when its data actually differs.
+        const prioritiesJson = JSON.stringify(data.priorities || {});
+        const panelsJson = JSON.stringify(data.panels || {});
+        const prioritiesChanged = prioritiesJson !== lastPrioritiesJson;
+        const panelsChanged = panelsJson !== lastPanelsJson;
+        lastPrioritiesJson = prioritiesJson;
+        lastPanelsJson = panelsJson;
+
+        renderAll({priorities: prioritiesChanged, panels: panelsChanged});
     } catch(e) {
         console.error('Fetch error:', e);
     }
@@ -2561,24 +3224,34 @@ async function mapPriorities() {
     fetchSessions();
 }
 
-async function togglePriorityItem(text, done) {
-    await fetch('/api/toggle-priority-item', {
+async function togglePriorityItem(text, done, id) {
+    const res = await fetch('/api/toggle-priority-item', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text, done})
+        body: JSON.stringify({text, done, id})
     });
     fetchSessions(true);
+    return res.ok;
 }
 
 function togglePriorityItemFromEl(el) {
     const text = el.dataset.text || '';
+    // The store gives every row an id, so the write targets a row rather
+    // than matching on the line's text.
+    const id = el.dataset.id ? Number(el.dataset.id) : null;
     const wasDone = el.dataset.done === '1';
     // Optimistic UI flip so the user sees immediate feedback
     el.classList.toggle('done', !wasDone);
     el.dataset.done = wasDone ? '0' : '1';
     const check = el.querySelector('.priority-check');
     if (check) check.textContent = wasDone ? '○' : '✓';
-    togglePriorityItem(text, !wasDone);
+    togglePriorityItem(text, !wasDone, id).then(ok => {
+        if (ok) return;
+        // Put it back rather than showing a state the store does not hold.
+        el.classList.toggle('done', wasDone);
+        el.dataset.done = wasDone ? '1' : '0';
+        if (check) check.textContent = wasDone ? '✓' : '○';
+    });
 }
 
 function setFilter(tag) {
@@ -2611,8 +3284,11 @@ function getFilteredSessions() {
     return filtered;
 }
 
-function renderAll() {
-    renderPriorities();
+function renderAll(changed) {
+    // No argument means "redraw everything": the direct callers after a write
+    // want the new state on screen regardless.
+    if (!changed || changed.priorities) renderPriorities();
+    if (!changed || changed.panels) renderPanels();
     renderTagCloudInline();
     renderFilterBar();
     renderCards();
@@ -2620,6 +3296,11 @@ function renderAll() {
 
 function renderPriorities() {
     const container = document.getElementById('prioritiesBar');
+    // A redraw replaces innerHTML, which destroys any open quick-add box and
+    // whatever was typed into it. Flags have proved too easy to clear from
+    // elsewhere, so ask the DOM directly.
+    if (container.querySelector('.quick-add-input')) return;
+    if (isDragging) return;
     const weeks = priorities.weeks?.length
         ? priorities.weeks
         : (priorities.days?.length ? [{title: priorities.weekTitle || 'This Week', days: priorities.days, isCurrent: true}] : []);
@@ -2632,28 +3313,189 @@ function renderPriorities() {
     if (!visibleWeeks.length) { container.innerHTML = ''; return; }
 
     const noCurrent = priorities.noCurrentWeek;
+    const live = priorities.source === 'store';
+
+    const renderItem = (item) => `<div class="priority-item ${item.done ? 'done' : ''}"
+        data-text="${escAttr(item.text)}"${item.id != null ? ` data-id="${item.id}"` : ''}
+        data-done="${item.done ? '1' : '0'}"
+        ${live && item.id != null ? 'draggable="true" ondragstart="dragTaskStart(event)"' : ''}
+        onclick="togglePriorityItemFromEl(this)" title="${escAttr(item.key || item.text)}">
+        <span class="priority-check">${item.done ? '✓' : '○'}</span>
+        <span class="priority-text">${escHtml(item.text)}</span>
+        ${item.load ? `<span class="priority-load">${escHtml(item.load)}</span>` : ''}
+    </div>`;
+
     const renderWeek = (w, showMapBtn, idx) => {
         let suffix = '';
         if (noCurrent && idx === 0) suffix = ' <span style="opacity:0.6">· upcoming (no plan for this week)</span>';
         else if (!w.isCurrent) suffix = ' <span style="opacity:0.6">· next week</span>';
+        if (w.locked) suffix += ' <span class="week-locked">locked</span>';
         return `<div class="priorities-week">
         <div class="priorities-header">
             <div class="priorities-title">${escHtml(w.title || (w.isCurrent ? 'This Week' : 'Next Week'))}${suffix}</div>
-            ${showMapBtn ? '<button class="map-btn" onclick="mapPriorities()">Map to sessions</button>' : ''}
+            <div class="priorities-actions">
+                ${live && w.weekStart && !w.locked ? `<button class="map-btn" onclick="lockWeek('${w.weekStart}')">Lock week</button>` : ''}
+                ${showMapBtn ? '<button class="map-btn" onclick="mapPriorities()">Map to sessions</button>' : ''}
+            </div>
         </div>
         <div class="priorities-days">
-            ${w.days.map(d => `<div class="priority-day">
+            ${w.days.map(d => `<div class="priority-day"
+                ${live && d.date ? `ondragover="dragOverDay(event)" ondragleave="dragLeaveDay(event)" ondrop="dropOnDay(event, '${d.date}')"` : ''}>
                 <div class="priority-day-name">${escHtml(d.day)}</div>
-                ${d.items.map(item => `<div class="priority-item ${item.done ? 'done' : ''}" data-text="${escAttr(item.text)}" data-done="${item.done ? '1' : '0'}" onclick="togglePriorityItemFromEl(this)">
-                    <span class="priority-check">${item.done ? '✓' : '○'}</span>
-                    <span class="priority-text">${escHtml(item.text)}</span>
-                </div>`).join('')}
+                ${d.items.map(renderItem).join('')}
+                ${live && d.date ? `<div class="quick-add" onclick="startQuickAdd(this, '${d.date}')">+ add</div>` : ''}
             </div>`).join('')}
         </div>
     </div>`;
     };
 
     container.innerHTML = visibleWeeks.map((w, i) => renderWeek(w, i === 0, i)).join('');
+}
+
+// --- drag a task onto a different day ------------------------------------
+
+let isDragging = false;
+
+function dragTaskStart(ev) {
+    const id = ev.currentTarget.dataset.id;
+    if (!id) return;
+    ev.dataTransfer.setData('text/plain', id);
+    ev.dataTransfer.effectAllowed = 'move';
+    // A drag lasts seconds. The five-second poll redraws by replacing
+    // innerHTML, which destroys the element under the cursor and aborts the
+    // drag: the day highlights on dragover but the drop never lands.
+    isDragging = true;
+    ev.currentTarget.addEventListener('dragend', () => {
+        isDragging = false;
+        document.querySelectorAll('.drop-target')
+            .forEach(el => el.classList.remove('drop-target'));
+    }, {once: true});
+}
+
+function dragOverDay(ev) {
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = 'move';
+    ev.currentTarget.classList.add('drop-target');
+}
+
+function dragLeaveDay(ev) {
+    ev.currentTarget.classList.remove('drop-target');
+}
+
+async function dropOnDay(ev, day) {
+    ev.preventDefault();
+    ev.currentTarget.classList.remove('drop-target');
+    const id = Number(ev.dataTransfer.getData('text/plain'));
+    if (!id) return;
+    await storeAction('task/plan', {id, day});
+    fetchSessions(true);
+}
+
+// --- quick add ------------------------------------------------------------
+
+function startQuickAdd(el, day) {
+    if (el.querySelector('input')) return;
+    el.innerHTML = '<input class="quick-add-input" placeholder="New task, Enter to save">';
+    const input = el.querySelector('input');
+    isEditing = true;
+    // The click that opened this box is still bubbling. A document-level
+    // listener clears isEditing whenever the tag overlay is hidden, and it
+    // runs after this handler, so setting the flag here alone is not enough:
+    // the next poll would replace the DOM and destroy the box mid-word.
+    // renderPriorities also refuses to redraw while this input exists.
+    setTimeout(() => { isEditing = true; input.focus(); }, 0);
+
+    let closed = false;
+    const finish = async (save) => {
+        if (closed) return;
+        closed = true;
+        const title = input.value.trim();
+        isEditing = false;
+        // Take the input out of the DOM before refreshing. renderPriorities
+        // refuses to redraw while one exists, so leaving it in place blocks
+        // the very refresh that would show the saved task: it saves, then
+        // sits there as an open box forever.
+        el.innerHTML = '+ add';
+        if (save && title) {
+            await storeAction('task/add', {title, plannedDay: day});
+            fetchSessions(true);
+        }
+    };
+    input.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        if (e.key === 'Escape') { e.preventDefault(); closed = true; isEditing = false;
+                                  el.innerHTML = '+ add'; }
+    };
+    // Clicking away keeps what was typed rather than discarding it. Losing a
+    // half-written task to an incidental focus change is the worse outcome.
+    input.onblur = () => finish(true);
+}
+
+async function storeAction(action, payload) {
+    const res = await fetch('/api/' + action, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        console.warn('store action failed', action, err);
+    }
+    return res.ok;
+}
+
+async function lockWeek(weekStart) {
+    if (!confirm('Lock this week? Planned rows are committed.')) return;
+    await storeAction('plan/lock', {weekStart});
+    fetchSessions(true);
+}
+
+async function taskAction(action, id) {
+    await storeAction('task/' + action, {id});
+    fetchSessions(true);
+}
+
+function renderPanels() {
+    const container = document.getElementById('panelsBar');
+    if (!container) return;
+    if (isDragging) return;   // dragging out of a panel must survive a poll
+    if (!panels.available) { container.innerHTML = ''; return; }
+
+    const itemRow = (item, actions) => `<div class="panel-item" draggable="true"
+        data-id="${item.id}" ondragstart="dragTaskStart(event)"
+        title="${escAttr(item.key || item.text)}">
+        <span class="panel-item-text">${escHtml(item.text)}</span>
+        ${item.key ? `<span class="panel-item-key">${escHtml(item.key)}</span>` : ''}
+        ${actions}
+    </div>`;
+
+    const section = (title, body, count) => `<details class="panel" ${count ? '' : 'data-empty="1"'}>
+        <summary>${escHtml(title)} <span class="panel-count">${count}</span></summary>
+        <div class="panel-body">${body}</div>
+    </details>`;
+
+    const proposed = panels.proposed.map(i => itemRow(i,
+        `<button class="panel-btn" onclick="event.stopPropagation();taskAction('confirm',${i.id})">keep</button>
+         <button class="panel-btn" onclick="event.stopPropagation();taskAction('dismiss',${i.id})">drop</button>`
+    )).join('') || '<div class="panel-empty">Nothing waiting on you.</div>';
+
+    const backlog = panels.backlog.map(i => itemRow(i, '')).join('')
+        || '<div class="panel-empty">Backlog is clear.</div>';
+
+    const projects = panels.projects.map(p => `<div class="panel-item">
+        <span class="panel-item-text">
+            <strong>${escHtml(p.name)}</strong>
+            ${p.next ? `<br><span class="panel-next" draggable="true" data-id="${p.next.id}" ondragstart="dragTaskStart(event)">${escHtml(p.next.text)}</span>`
+                     : '<br><span class="panel-empty">no next action</span>'}
+        </span>
+        <span class="panel-item-key">${p.openCount} open${p.status !== 'active' ? ' · ' + escHtml(p.status) : ''}</span>
+        ${p.notePath ? `<a class="panel-btn" href="${p.notePath}" onclick="event.stopPropagation()">note</a>` : ''}
+    </div>`).join('') || '<div class="panel-empty">No active projects.</div>';
+
+    container.innerHTML =
+        section('Proposed', proposed, panels.proposed.length) +
+        section('Backlog', backlog, panels.backlog.length) +
+        section('Projects', projects, panels.projects.length);
 }
 
 function renderTagCloudInline() {
@@ -3018,6 +3860,8 @@ function closeTagInput(event) {
 // Safety: reset isEditing if overlay is hidden but flag is stuck
 document.addEventListener('click', () => {
     const overlay = document.getElementById('tagInputOverlay');
+    // A quick-add box is an editor too, and it does not use this overlay.
+    if (document.querySelector('.quick-add-input')) return;
     if (isEditing && overlay && overlay.style.display === 'none') {
         isEditing = false;
     }
@@ -3481,9 +4325,27 @@ setInterval(fetchSessions, 5000);
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Claude Session Manager")
+    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--root", type=Path, default=None,
+                    help="content repo to read (overrides MELLONHEAD_ROOT)")
+    args = ap.parse_args()
+
+    PORT = args.port
+    if args.root:
+        MELLONHEAD_ROOT = args.root.expanduser()
+        PRIORITIES_FILE = MELLONHEAD_ROOT / "priorities.md"
+        STORE_FILE = MELLONHEAD_ROOT / "operations" / "tasks.db"
+
     SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Claude Session Manager running at http://localhost:{PORT}")
+    print(f"  repo:  {MELLONHEAD_ROOT}")
+    print(f"  state: {STATE_DIR}")
+    if PORT != 7433:
+        print("  (dev instance — live manager is on 7433)")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

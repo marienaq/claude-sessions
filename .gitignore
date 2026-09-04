@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# store artifacts, if a dev run ever leaves them in the tree
+tasks.db
+tasks.db-wal
+tasks.db-shm
+tasks.json
+tasks-audit.log
