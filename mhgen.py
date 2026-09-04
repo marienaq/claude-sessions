@@ -294,6 +294,26 @@ def render_week(store, week_start):
     return "\n".join(lines)
 
 
+def weeks_to_render(store, today=None):
+    """
+    The current week, plus any later week that has been proposed.
+
+    Rendering only the latest week meant that proposing next week on a
+    Friday deleted the running week from the file: the store still had it and
+    the dashboard still showed it, but the markdown MQ works from lost
+    Thursday and Friday mid-week.
+    """
+    today = (today or date.today()).isoformat()
+    starts = [r["week_start"] for r in store.conn.execute(
+        "SELECT week_start FROM weeks ORDER BY week_start")]
+    if not starts:
+        return []
+    current = [w for w in starts if w <= today]
+    chosen = [current[-1]] if current else [starts[0]]
+    chosen += [w for w in starts if w > chosen[0]]
+    return chosen
+
+
 def generate_priorities(store, repo, week_start=None, dry_run=False):
     """
     Replace priorities.md from its week header down.
@@ -304,12 +324,11 @@ def generate_priorities(store, repo, week_start=None, dry_run=False):
     """
     path = repo / "priorities.md"
     if week_start is None:
-        row = store.conn.execute(
-            "SELECT week_start FROM weeks ORDER BY week_start DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
+        chosen = weeks_to_render(store)
+        if not chosen:
             return None
-        week_start = row["week_start"]
+    else:
+        chosen = [week_start]
 
     preamble = []
     if path.exists():
@@ -327,7 +346,17 @@ def generate_priorities(store, repo, week_start=None, dry_run=False):
         while preamble and not preamble[-1].strip():
             preamble.pop()
 
-    text = "\n".join(preamble + ["", render_week(store, week_start)])
+    rendered = []
+    for i, wk in enumerate(chosen):
+        block = render_week(store, wk)
+        if i:
+            # Only the first block carries the generated marker; a second one
+            # mid-file reads like the boundary moved.
+            block = "\n".join(l for l in block.splitlines()
+                               if not l.startswith("<!-- GENERATED"))
+            rendered.append("\n---\n")
+        rendered.append(block)
+    text = "\n".join(preamble + [""] + rendered)
     text = text.lstrip("\n").rstrip("\n") + "\n"
     if dry_run:
         return text

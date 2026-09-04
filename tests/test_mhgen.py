@@ -175,6 +175,34 @@ class TestPrioritiesGeneration(GenCase):
         self.assertIn("Rule 1: something MQ wrote.", text)
         self.assertNotIn("old content", text, "the week itself is regenerated")
 
+    def test_a_proposed_week_does_not_evict_the_running_one(self):
+        """
+        Proposing next week on a Friday used to delete the running week from
+        the file. The store still had it and the dashboard still showed it,
+        but the markdown MQ works from lost Thursday and Friday mid-week.
+        """
+        nxt = self.monday + timedelta(days=7)
+        self.store.upsert_week(nxt.isoformat(), proposed_at="2026-09-04T13:06:00")
+        self.store.add_task("proj", "Next week work", display_ord="9",
+                            planned_day=(nxt + timedelta(days=1)).isoformat(),
+                            status="planned")
+        (self.repo / "priorities.md").write_text("# P\n\n## Weekly Goals\n")
+        text = mhgen.generate_priorities(self.store, self.repo)
+
+        self.assertIn("Scheduled work", text, "the running week must survive")
+        self.assertIn("Next week work", text, "the proposal must appear")
+        headers = [l for l in text.splitlines() if l.startswith("**Week of")]
+        self.assertEqual(len(headers), 2)
+        self.assertIn("not confirmed", headers[1])
+        self.assertEqual(text.count("<!-- GENERATED"), 1,
+                         "one boundary marker, not one per week")
+
+    def test_only_the_current_week_when_nothing_is_proposed(self):
+        (self.repo / "priorities.md").write_text("# P\n\n## Weekly Goals\n")
+        text = mhgen.generate_priorities(self.store, self.repo)
+        self.assertEqual(len([l for l in text.splitlines()
+                              if l.startswith("**Week of")]), 1)
+
     def test_sections_rendered(self):
         (self.repo / "priorities.md").write_text("# P\n\n## Weekly Goals\n")
         text = mhgen.generate_priorities(self.store, self.repo)
