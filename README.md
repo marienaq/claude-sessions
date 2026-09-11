@@ -158,6 +158,25 @@ Each session card shows:
 - **Review toggle** — circle icon to flag for offline review
 - **Close button** — sends SIGINT and closes the iTerm2 tab
 
+## Task view
+
+The **Tasks** tab (and `#task/<id>` links from day-card lines, session
+cards, and the Projects panel) opens one page per store task, in the order
+of what MQ needs to decide: the top of the brief, the open questions with
+Accept / Answer, the conversations on the task (click to focus or resume),
+and what agents have out and have done. Everything on it is read from the
+store; the brief is the only file parsed, and only its header, `## Goal`
+and `## Deliverables`.
+
+**Work on this with Orca** resumes the most recent conversation whose `mh`
+writes touched the task, or opens a fresh `claude --agent orca` on it.
+Design and plan: `operations/ai-workflows/task-view/` in the content repo.
+
+The store behind it (`mhstore.py`) records every `mh` write as an event
+stamped with the Claude conversation that made it (`mhsession.py` finds the
+session from the process tree), holds questions with a proposed answer and
+who they block, and derives dispatch-readiness rather than storing it.
+
 ## Weekly priorities
 
 The priorities bar at the top reads from `~/Projects/mellonhead/priorities.md`. It shows day-by-day goals with clickable checkboxes. Completed days are hidden automatically. Checking an item updates the markdown file and appends the completion date.
@@ -199,3 +218,9 @@ This means Claude knows what steps have been done and what's next when you resum
 | POST | `/api/toggle-priority-item` | Check/uncheck a weekly priority item |
 | POST | `/api/resume` | Open new iTerm tab and run `claude --resume <id>` |
 | POST | `/api/archive` | Hide an inactive conversation from the dashboard |
+| GET | `/api/tasks` | In-flight tasks: open rows with a brief, an open question, an open dispatch, or a live conversation |
+| GET | `/api/task/<id>` | One task's page: task, brief top, questions, conversations, open dispatches, last 50 events |
+| POST | `/api/question/answer` | Record MQ's answer to a question (`actor=mq`, `source=dashboard`) |
+| POST | `/api/question/accept` | Answer a question with its proposed answer |
+| POST | `/api/task/link` | Link a conversation to a store task; records a `link` event |
+| POST | `/api/task/orca` | Resume the conversation that last touched the task, or open Orca on it |

@@ -663,6 +663,332 @@ def load_panels():
             "available": True}
 
 
+# ---------------------------------------------------------------------------
+# The task view (operations/ai-workflows/task-view/design.md §5, plan §B)
+#
+# One page per task: the brief, the questions MQ has to answer, the
+# conversations open on it, and what the agents did and will do next. All
+# of it read from the store; nothing here parses prose except the top of
+# the brief file.
+# ---------------------------------------------------------------------------
+
+_BRIEF_HEADER_LINE = re.compile(r"^\*\*([^*]+?):\*\*\s*(.*)$")
+
+
+def parse_brief(rel_path):
+    """
+    The header block (`**Key:** value` lines above the first rule) and the
+    `## Goal` and `## Deliverables` sections. Nothing else in the file is
+    read: the whole brief is one click away in Obsidian, not on the page.
+    """
+    result = {"path": rel_path, "obsidianUrl": obsidian_url(rel_path),
+              "exists": False, "title": "", "header": {}, "goal": "",
+              "deliverables": ""}
+    if not rel_path:
+        return result
+    path = MELLONHEAD_ROOT / rel_path
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return result
+    result["exists"] = True
+    lines = text.splitlines()
+    for line in lines:
+        if line.startswith("# "):
+            result["title"] = line[2:].strip()
+            break
+    head = text.split("\n---", 1)[0]
+    for line in head.splitlines():
+        m = _BRIEF_HEADER_LINE.match(line.strip())
+        if m:
+            # Values are displayed as text, so bold and backticks come off.
+            value = re.sub(r"\*\*|`", "", m.group(2)).strip()
+            result["header"][m.group(1).strip()] = value
+
+    def section(name):
+        out, inside = [], False
+        for line in lines:
+            if re.match(r"^##\s+", line):
+                if inside:
+                    break
+                inside = re.match(rf"^##\s+{name}\b", line, re.I) is not None
+                continue
+            if inside:
+                out.append(line)
+        return "\n".join(out).strip()
+
+    result["goal"] = section("Goal")
+    result["deliverables"] = section("Deliverables")
+    return result
+
+
+def _task_tag(task):
+    if task["project_key"] != mhstore.ONE_OFF and task["display_ord"]:
+        return f"{task['project_key']}#{task['display_ord']}"
+    return f"#{task['id']}"
+
+
+def _question_item(q, store):
+    task = store.task(q["task_id"]) if q["task_id"] else None
+    return {
+        "id": q["id"], "taskId": q["task_id"], "projectKey": q["project_key"],
+        "task": _task_tag(task) if task else None,
+        "taskTitle": task["title"] if task else None,
+        "text": q["text"], "proposed": q["proposed"], "blocks": q["blocks"],
+        "askedBy": q["asked_by"], "askedAt": q["asked_at"],
+        "status": q["status"], "answer": q["answer"],
+    }
+
+
+def _event_item(e):
+    return {
+        "id": e["id"], "ts": e["ts"], "actor": e["actor"], "kind": e["kind"],
+        "summary": e["summary"], "agent": e["agent"], "verdict": e["verdict"],
+        "artifactPath": e["artifact_path"],
+        "artifactUrl": obsidian_url(e["artifact_path"]) if e["artifact_path"] else None,
+        "sessionId": e["session_id"], "itermId": e["iterm_id"],
+    }
+
+
+# The board's session list is expensive (AppleScript, ps, a transcript scan)
+# and already computed every five seconds for /api/sessions. The task page
+# joins against that result rather than computing its own.
+_SESSIONS_CACHE = {"at": 0, "sessions": []}
+SESSIONS_CACHE_TTL = 10
+
+
+def cached_sessions():
+    if time.time() - _SESSIONS_CACHE["at"] > SESSIONS_CACHE_TTL:
+        _SESSIONS_CACHE["sessions"] = get_all_sessions()
+        _SESSIONS_CACHE["at"] = time.time()
+    return _SESSIONS_CACHE["sessions"]
+
+
+def task_conversations(store, task, sessions_list, state):
+    """
+    Every conversation on this task: those that wrote to it through mh,
+    cards linked to it in sessions.json, and the transcripts the board
+    already discovered, joined on the Claude session id. Live first.
+    """
+    by_sid = {}
+    for s in sessions_list:
+        sid = s.get("claudeSessionId") or s.get("sessionId")
+        if sid:
+            by_sid[sid] = s
+
+    seen, rows = set(), []
+
+    def add(sid, iterm_id=None, source=None, info=None, last_event=None):
+        if not sid or sid in seen:
+            return
+        seen.add(sid)
+        card = by_sid.get(sid)
+        info = info or {}
+        live = bool(card and not card.get("isInactive"))
+        kind = info.get("kind")
+        if card and card.get("isAutomation"):
+            kind = "scheduled"
+        actor = info.get("actor") or ("sweep" if kind == "scheduled" else None)
+        rows.append({
+            "sessionId": sid,
+            "itermId": (card or {}).get("itermId") or iterm_id or info.get("iterm_id"),
+            "live": live,
+            "state": (card or {}).get("cardState", "inactive" if card else "unknown"),
+            "name": (card or {}).get("name") or info.get("name") or sid[:8],
+            "cwd": (card or {}).get("cwd") or info.get("cwd") or "",
+            "actor": actor,
+            "kind": kind or ("interactive" if card else "unknown"),
+            "isAutomation": bool(card and card.get("isAutomation")),
+            "age": (card or {}).get("uptime") or "",
+            "lastSeen": info.get("last_seen"),
+            "lastEvent": _event_item(last_event) if last_event else None,
+            "eventCount": info.get("event_count", 0),
+            "source": source,
+        })
+
+    for info in store.sessions_for_task(task["id"]):
+        add(info["session_id"], info.get("iterm_id"), "events", info,
+            info.get("last_event"))
+    for key, link in (state.get("taskAssignments") or {}).items():
+        if isinstance(link, dict) and link.get("taskId") == task["id"]:
+            card = by_sid.get(key)
+            if card:
+                add(key, card.get("itermId"), "link", None, None)
+            else:
+                # Keyed by iTerm id for a live card whose Claude id we know.
+                for s in sessions_list:
+                    if s.get("itermId") == key:
+                        add(s.get("claudeSessionId") or key, key, "link")
+                        break
+                else:
+                    add(key, None, "link")
+    rows.sort(key=lambda r: (not r["live"], r["lastSeen"] or "", ), reverse=False)
+    live = [r for r in rows if r["live"]]
+    rest = sorted([r for r in rows if not r["live"]],
+                  key=lambda r: r["lastSeen"] or "", reverse=True)
+    return live + rest
+
+
+def task_view_payload(task_id, sessions_list=None, state=None):
+    """GET /api/task/<id>: everything the page needs, in one read."""
+    store = get_store()
+    if store is None:
+        return None
+    task = store.task(task_id)
+    if task is None:
+        return None
+    project = store.project(task["project_key"]) or {}
+    sessions_list = cached_sessions() if sessions_list is None else sessions_list
+    state = load_store() if state is None else state
+
+    task_qs = store.questions(task_id=task["id"])
+    project_qs = [q for q in store.questions(project_key=task["project_key"])
+                  if q["task_id"] != task["id"]]
+    dispatches = store.open_dispatches(task["id"])
+    events = store.events(task_id=task["id"], limit=50)
+    brief = parse_brief(task["brief_path"])
+
+    return {
+        "task": {
+            "id": task["id"], "tag": _task_tag(task), "title": task["title"],
+            "status": task["status"], "statusRaw": task["status_raw"],
+            "owner": task["owner"], "load": task["load"], "due": task["due"],
+            "plannedDay": task["planned_day"], "waitingOn": task["waiting_on"],
+            "notes": task["notes"], "notePath": task["note_path"],
+            "noteUrl": obsidian_url(task["note_path"]) if task["note_path"] else None,
+            "briefPath": task["brief_path"], "confirmed": bool(task["confirmed"]),
+            "doneAt": task["done_at"], "updatedAt": task["updated_at"],
+        },
+        "project": {"key": project.get("key"), "name": project.get("name"),
+                    "status": project.get("status"), "dir": project.get("dir")},
+        "brief": brief,
+        "dispatchReady": store.dispatch_ready(task["id"]),
+        "questions": {"task": [_question_item(q, store) for q in task_qs],
+                      "project": [_question_item(q, store) for q in project_qs]},
+        "conversations": task_conversations(store, task, sessions_list, state),
+        "next": {
+            "dispatches": [_event_item(d) for d in dispatches],
+            "waitingOn": [q["id"] for q in task_qs if q["blocks"]],
+        },
+        "events": [_event_item(e) for e in events],
+    }
+
+
+def inflight_tasks(sessions_list=None, state=None):
+    """
+    The Tasks tab: open rows that have a brief, an open question, an open
+    dispatch, or a live conversation, ordered by when they bite.
+    """
+    store = get_store()
+    if store is None:
+        return []
+    sessions_list = cached_sessions() if sessions_list is None else sessions_list
+    state = load_store() if state is None else state
+
+    live_by_task = {}
+    live_sids = {s.get("claudeSessionId") or s.get("sessionId")
+                 for s in sessions_list if not s.get("isInactive")}
+    live_sids.discard(None)
+    if live_sids:
+        marks = ",".join("?" * len(live_sids))
+        for row in store.conn.execute(
+                f"""SELECT task_id, COUNT(DISTINCT session_id) AS n FROM events
+                    WHERE session_id IN ({marks}) AND task_id IS NOT NULL
+                    GROUP BY task_id""", tuple(live_sids)):
+            live_by_task[row["task_id"]] = row["n"]
+    for key, link in (state.get("taskAssignments") or {}).items():
+        if isinstance(link, dict) and link.get("taskId") and key in live_sids:
+            live_by_task[link["taskId"]] = live_by_task.get(link["taskId"], 0) + 1
+
+    open_q = {}
+    for q in store.questions():
+        if q["task_id"] is not None:
+            open_q[q["task_id"]] = open_q.get(q["task_id"], 0) + 1
+    open_dispatch = {}
+    for row in store.conn.execute(
+            "SELECT DISTINCT task_id FROM events WHERE kind = 'dispatch'"):
+        if row["task_id"] is not None and store.open_dispatches(row["task_id"]):
+            open_dispatch[row["task_id"]] = True
+    last_activity = {r["task_id"]: r["ts"] for r in store.conn.execute(
+        "SELECT task_id, MAX(ts) AS ts FROM events WHERE task_id IS NOT NULL "
+        "GROUP BY task_id")}
+
+    rows = []
+    for task in store.tasks(open_only=True):
+        tid = task["id"]
+        if not (task["brief_path"] or open_q.get(tid) or open_dispatch.get(tid)
+                or live_by_task.get(tid)):
+            continue
+        rows.append({
+            "id": tid, "tag": _task_tag(task), "title": task["title"],
+            "project": task["project_key"], "status": task["status"],
+            "plannedDay": task["planned_day"], "due": task["due"],
+            "load": task["load"], "hasBrief": bool(task["brief_path"]),
+            "openQuestions": open_q.get(tid, 0),
+            "openDispatches": bool(open_dispatch.get(tid)),
+            "liveConversations": live_by_task.get(tid, 0),
+            "lastActivity": last_activity.get(tid),
+        })
+    rows.sort(key=lambda r: (r["plannedDay"] is None, r["plannedDay"] or "",
+                             r["due"] is None, r["due"] or "",
+                             r["lastActivity"] or ""))
+    return rows
+
+
+def find_task_session(store, task_id, max_age_days=14):
+    """
+    The most recent conversation whose writes touched this task and whose
+    transcript is still on disk, or None. Resuming it beats starting fresh:
+    the agent still holds what it read and why it did what it did.
+    """
+    cutoff = time.time() - max_age_days * 86400
+    for row in store.conn.execute(
+            """SELECT session_id, MAX(ts) AS last FROM events
+               WHERE task_id = ? AND session_id IS NOT NULL
+               GROUP BY session_id ORDER BY last DESC""", (task_id,)):
+        sid = row["session_id"]
+        for jsonl in CLAUDE_PROJECTS_DIR.glob(f"*/{sid}.jsonl"):
+            try:
+                if jsonl.stat().st_mtime >= cutoff:
+                    return sid, extract_cwd_fast(str(jsonl)) or str(MELLONHEAD_ROOT)
+            except OSError:
+                continue
+    return None
+
+
+def task_orca_prompt(store, task, resuming=False):
+    """The opening line for `claude --agent orca` on one task."""
+    tag = _task_tag(task)
+    lines = [f"Work on {tag}: {task['title']}", ""]
+    if resuming:
+        lines += ["You have worked on this task in this conversation before, so "
+                  "you still hold your own reasoning. Re-read the current state "
+                  "before saying anything:", ""]
+    else:
+        lines += ["Read these first, then talk to me:", ""]
+    if task["brief_path"]:
+        lines.append(f"- the brief at `{task['brief_path']}`")
+    else:
+        lines.append("- there is no brief yet: run `/scope-and-start` on this "
+                     "task and record the brief with `./operations/mh task "
+                     f"brief {tag} <path>` before anything else")
+    lines += [
+        f"- `./operations/mh question list {tag}` for what is still waiting on me",
+        f"- `./operations/mh task list {task['project_key']} --json` for the "
+        "open dispatches and the last review",
+    ]
+    if task["note_path"]:
+        lines.append(f"- the note file at `{task['note_path']}`")
+    lines += [
+        "",
+        "Then continue the work on this task. Record what you do through "
+        "`mh` (`task dispatch`, `task deliver`, `task review`, `question add`), "
+        "always with `--actor orca`, and ask me nothing that you can propose "
+        "an answer to instead.",
+    ]
+    return "\n".join(lines)
+
+
 def parse_priorities():
     """Entry point used by the handlers. Store first, markdown as a fallback."""
     return load_priorities()
@@ -1156,6 +1482,42 @@ def build_inactive_card(inactive, store):
     }
 
 
+def resolve_task_assignments(state):
+    """
+    One-time pass: a task assignment made before the store carried a Notion
+    task id and a path, and nothing joined it to a store row. Resolve each
+    to `taskId` and `projectKey` where the Notion id matches a row, and
+    mark the rest so they are not retried every poll.
+    """
+    store = get_store()
+    if store is None:
+        return False
+    changed = False
+    for key, link in (state.get("taskAssignments") or {}).items():
+        if not isinstance(link, dict) or "taskId" in link:
+            continue
+        notion = (link.get("notionTaskId") or "").replace("-", "").lower()
+        task = None
+        if notion:
+            for row in store.conn.execute(
+                    "SELECT id, project_key, notion_task_id FROM tasks "
+                    "WHERE notion_task_id IS NOT NULL"):
+                if (row["notion_task_id"] or "").replace("-", "").lower() == notion:
+                    task = row
+                    break
+        if task is None and link.get("taskFile") and link.get("taskTitle"):
+            project = project_for_cwd(str(Path(link["taskFile"]).parent))
+            if project:
+                for row in store.tasks(project_key=project["key"]):
+                    if row["title"].strip().lower() == link["taskTitle"].strip().lower():
+                        task = row
+                        break
+        link["taskId"] = task["id"] if task else None
+        link["projectKey"] = task["project_key"] if task else None
+        changed = True
+    return changed
+
+
 # Cache mapping iTerm session ID -> Claude session ID for the current live sessions.
 # Refreshed at the end of get_all_sessions. Allows mutation endpoints to resolve the
 # canonical (Claude-session-id) key from whatever key the frontend passes.
@@ -1379,7 +1741,8 @@ def week_review_prompt(store, week_start, resuming=False):
     return "\n".join(lines)
 
 
-def launch_claude_session(cwd, prompt, resume_id=None):
+def launch_claude_session(cwd, prompt, resume_id=None, agent=None,
+                          prompt_name="week-review-prompt.md"):
     """
     Open an iTerm tab running `claude` with a prepared opening prompt.
 
@@ -1388,16 +1751,17 @@ def launch_claude_session(cwd, prompt, resume_id=None):
     all of which have to survive Python, AppleScript and the shell intact.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    prompt_file = STATE_DIR / "week-review-prompt.md"
+    prompt_file = STATE_DIR / prompt_name
     prompt_file.write_text(prompt)
 
     safe_cwd = shlex.quote(cwd)
     safe_prompt = shlex.quote(str(prompt_file))
+    flags = f" --agent {shlex.quote(agent)}" if agent else ""
     if resume_id:
-        command = (f"cd {safe_cwd} && claude --resume {shlex.quote(resume_id)} "
+        command = (f"cd {safe_cwd} && claude{flags} --resume {shlex.quote(resume_id)} "
                    f"\"$(cat {safe_prompt})\"")
     else:
-        command = f"cd {safe_cwd} && claude \"$(cat {safe_prompt})\""
+        command = f"cd {safe_cwd} && claude{flags} \"$(cat {safe_prompt})\""
     escaped = command.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
     tell application "iTerm2"
@@ -1673,11 +2037,17 @@ def get_all_sessions():
             continue
         sessions.append(build_inactive_card(inactive, store))
 
+    if resolve_task_assignments(store):
+        store_dirty = True
+
     if store_dirty:
         save_store(store)
 
     # Update the index so Claude sessions can find their todo files
     update_todo_index(sessions)
+
+    _SESSIONS_CACHE["sessions"] = sessions
+    _SESSIONS_CACHE["at"] = time.time()
 
     # Refresh the iTermID -> claudeSessionID cache so mutation endpoints can resolve
     # incoming keys to their canonical form
@@ -1811,6 +2181,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "projectName": "",
                         })
             self.send_json(files)
+        elif self.path == "/api/tasks":
+            self.send_json({"tasks": inflight_tasks(),
+                            "available": get_store() is not None})
+        elif self.path.startswith("/api/task/"):
+            try:
+                task_id = int(self.path.rsplit("/", 1)[-1])
+            except ValueError:
+                self.send_json({"error": "Bad task id"}, 400)
+                return
+            payload = task_view_payload(task_id)
+            if payload is None:
+                self.send_json({"error": "No such task"}, 404)
+                return
+            self.send_json(payload)
         elif self.path == "/":
             self.send_html(HTML_PAGE)
         else:
@@ -1947,6 +2331,102 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "Line not found"}, 400)
             else:
                 self.send_json({"ok": False}, 400)
+            return
+
+        elif self.path in ("/api/question/answer", "/api/question/accept"):
+            # MQ's answers, written with actor=mq so the record says she
+            # decided, not the dashboard. The trimmed list comes back so the
+            # page can redraw without another round trip.
+            body = self.read_body()
+            store = get_store()
+            if store is None:
+                self.send_json({"ok": False, "error": "No store"}, 503)
+                return
+            try:
+                qid = int(body.get("id"))
+            except (TypeError, ValueError):
+                self.send_json({"ok": False, "error": "Bad question id"}, 400)
+                return
+            try:
+                if self.path.endswith("/accept"):
+                    q = store.answer_question(qid, actor="mq", accept=True,
+                                              source="dashboard")
+                else:
+                    q = store.answer_question(qid, (body.get("answer") or "").strip(),
+                                              actor="mq", source="dashboard")
+            except mhstore.StoreError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+                return
+            regenerate_views([q["project_key"]])
+            remaining = {"task": [], "project": []}
+            if q["task_id"]:
+                remaining["task"] = [_question_item(x, store)
+                                     for x in store.questions(task_id=q["task_id"])]
+            remaining["project"] = [_question_item(x, store)
+                                    for x in store.questions(project_key=q["project_key"])
+                                    if x["task_id"] != q["task_id"]]
+            self.send_json({"ok": True, "question": _question_item(q, store),
+                            "questions": remaining})
+            return
+
+        elif self.path == "/api/task/link":
+            # A conversation is about this task. Written beside the path the
+            # old link keeps, and recorded as a link event so the task page
+            # lists the conversation even before it has written anything.
+            body = self.read_body()
+            store = get_store()
+            state = load_store()
+            key = canonical_key(body.get("itermId", ""))
+            try:
+                task = store.task(int(body.get("taskId"))) if store else None
+            except (TypeError, ValueError):
+                task = None
+            if not key or task is None:
+                self.send_json({"ok": False, "error": "Need itermId and a real taskId"}, 400)
+                return
+            project = store.project(task["project_key"]) or {}
+            path = (str(MELLONHEAD_ROOT / project["dir"] / "task-list.md")
+                    if project.get("dir") else "")
+            assignments = state.setdefault("taskAssignments", {})
+            assignments[key] = {
+                "taskFile": path, "notionTaskId": task["notion_task_id"] or "",
+                "taskTitle": task["title"], "taskId": task["id"],
+                "projectKey": task["project_key"],
+            }
+            if path:
+                state.setdefault("taskLinks", {})[key] = path
+            save_store(state)
+            iterm_id = next((s.get("itermId") for s in cached_sessions()
+                             if (s.get("claudeSessionId") or s.get("itermId")) == key), None)
+            sid = key if len(key) == 36 and key.count("-") == 4 else None
+            try:
+                store.link_session(task["id"], actor="mq", session_id=sid,
+                                   iterm_id=iterm_id or body.get("itermId"))
+            except mhstore.StoreError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+                return
+            self.send_json({"ok": True, "taskId": task["id"]})
+            return
+
+        elif self.path == "/api/task/orca":
+            # Resume the conversation that last touched the task, or open a
+            # fresh Orca on it. Same shape as "Review with Orca" for a week.
+            body = self.read_body()
+            store = get_store()
+            try:
+                task = store.task(int(body.get("taskId"))) if store else None
+            except (TypeError, ValueError):
+                task = None
+            if task is None:
+                self.send_json({"ok": False, "error": "No such task"}, 404)
+                return
+            found = find_task_session(store, task["id"])
+            resume_id, cwd = (found if found else (None, str(MELLONHEAD_ROOT)))
+            prompt = task_orca_prompt(store, task, resuming=bool(resume_id))
+            ok = launch_claude_session(cwd or str(MELLONHEAD_ROOT), prompt,
+                                       resume_id=resume_id, agent="orca",
+                                       prompt_name=f"task-{task['id']}-prompt.md")
+            self.send_json({"ok": ok, "taskId": task["id"], "resumed": resume_id})
             return
 
         # -------------------------------------------------------------
@@ -2317,12 +2797,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     expanded = str(Path(task_file).expanduser())
                     if Path(expanded).exists():
                         links[iterm_id] = expanded
-                        if notion_task_id:
+                        if notion_task_id or body.get("taskId"):
                             assignments[iterm_id] = {
                                 "taskFile": expanded,
                                 "notionTaskId": notion_task_id,
                                 "taskTitle": task_title,
                             }
+                            # The store row, when the picker came from the
+                            # store: the task page joins on this.
+                            task_store = get_store()
+                            linked = None
+                            if task_store is not None:
+                                try:
+                                    linked = task_store.task(int(body.get("taskId")))
+                                except (TypeError, ValueError):
+                                    linked = None
+                                if linked is None and notion_task_id:
+                                    wanted = notion_task_id.replace("-", "").lower()
+                                    for row in task_store.tasks():
+                                        if (row["notion_task_id"] or "").replace("-", "").lower() == wanted:
+                                            linked = row
+                                            break
+                            assignments[iterm_id]["taskId"] = linked["id"] if linked else None
+                            assignments[iterm_id]["projectKey"] = linked["project_key"] if linked else None
+                            if linked is not None:
+                                sid = iterm_id if len(iterm_id) == 36 and iterm_id.count("-") == 4 else None
+                                try:
+                                    task_store.link_session(linked["id"], actor="mq",
+                                                            session_id=sid,
+                                                            iterm_id=body.get("itermId", ""))
+                                except Exception as exc:      # noqa: BLE001
+                                    print(f"link event failed: {exc}")
                         else:
                             assignments.pop(iterm_id, None)
                         save_store(store)
@@ -2547,6 +3052,109 @@ body {
     font-size: 13px;
     color: var(--text-dim);
 }
+
+/* Tabs: Board | Tasks */
+.tabs { display: flex; gap: 4px; margin-left: 18px; }
+.tab {
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    color: var(--text-dim);
+    text-decoration: none;
+    cursor: pointer;
+}
+.tab:hover { color: var(--accent); }
+.tab.active { border-color: var(--border); background: var(--surface); color: var(--text); font-weight: 600; }
+.tab-count { opacity: 0.55; font-weight: 400; margin-left: 4px; }
+
+/* The Tasks list and the task page */
+.tasks-list { padding: 8px 24px 40px; max-width: 980px; }
+.tasks-row {
+    display: grid;
+    grid-template-columns: 150px 1fr 90px 70px 60px;
+    gap: 12px;
+    align-items: center;
+    padding: 7px 10px;
+    margin: 0 -10px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: var(--text);
+    text-decoration: none;
+}
+.tasks-row:hover { background: var(--accent-dim); }
+.tasks-row .tag { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-dim); }
+.tasks-row .when { font-size: 11px; color: var(--text-dim); }
+.tasks-row .qcount { font-size: 11px; color: var(--orange); font-weight: 600; }
+.tasks-row .dots { display: flex; gap: 4px; }
+.tasks-head { font-size: 11px; color: var(--text-faint); padding: 4px 0; }
+.task-page { padding: 8px 24px 60px; max-width: 980px; }
+.task-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 14px; margin-bottom: 4px; }
+.task-head h2 { font-size: 20px; font-weight: 600; }
+.task-head .tag { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--accent); }
+.task-meta { font-size: 12px; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
+.task-meta .status { text-transform: capitalize; }
+.task-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.task-actions a.map-btn { text-decoration: none; display: inline-block; }
+.task-block { margin-bottom: 22px; }
+.task-block h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+    margin-bottom: 8px;
+    display: flex; align-items: center; gap: 8px;
+}
+.task-block h3 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.brief-header { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+.brief-header b { color: var(--text); font-weight: 500; }
+.brief-section { font-size: 13px; line-height: 1.5; white-space: pre-wrap; margin-bottom: 8px; }
+.brief-section h4 { font-size: 12px; margin-bottom: 2px; color: var(--text-dim); }
+.brief-missing { font-size: 13px; color: var(--orange); }
+.q-row {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 8px 10px; margin: 0 -10px 4px;
+    border-radius: 6px; font-size: 13px; line-height: 1.45;
+    background: var(--next-step-bg);
+}
+.q-row .qid { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--accent); flex-shrink: 0; padding-top: 2px; }
+.q-row .qbody { flex: 1; min-width: 0; }
+.q-row .qmeta { font-size: 11px; color: var(--text-dim); }
+.q-row .qmeta b { color: var(--text); font-weight: 600; }
+.q-row .qactions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
+.q-row.project { background: transparent; border: 1px dashed var(--border); }
+.q-rule { border-top: 1px solid var(--border); margin: 10px 0 8px; font-size: 11px; color: var(--text-faint); padding-top: 6px; }
+.answer-input {
+    width: 100%; font: inherit; font-size: 13px;
+    background: var(--bg); border: 1px solid var(--accent); color: var(--text);
+    padding: 4px 8px; border-radius: 4px; outline: none; margin-top: 6px;
+}
+.conv-row {
+    display: grid; grid-template-columns: 14px 1fr auto auto; gap: 10px; align-items: center;
+    padding: 6px 10px; margin: 0 -10px; border-radius: 6px; font-size: 13px; cursor: pointer;
+}
+.conv-row:hover { background: var(--accent-dim); }
+.conv-row .who { font-size: 11px; color: var(--text-dim); }
+.conv-row .last { font-size: 11px; color: var(--text-dim); grid-column: 2 / span 3; margin-top: -2px; }
+.conv-row.dead { opacity: 0.75; }
+.agents-cols { display: grid; grid-template-columns: 1fr 1.4fr; gap: 24px; }
+@media (max-width: 720px) { .agents-cols { grid-template-columns: 1fr; } .tasks-row { grid-template-columns: 1fr; gap: 2px; } }
+.event-row { display: grid; grid-template-columns: 82px 1fr; gap: 10px; font-size: 12px; padding: 3px 0; line-height: 1.4; }
+.event-row .when { color: var(--text-faint); font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+.event-row .actor { color: var(--text-dim); }
+.event-row .kind { color: var(--accent); }
+.event-row a { color: var(--accent); text-decoration: none; }
+.event-row a:hover { text-decoration: underline; }
+.next-row { font-size: 13px; padding: 4px 0; }
+.next-row .who { font-weight: 600; }
+.next-row .path { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-dim); }
+.task-empty { font-size: 12px; color: var(--text-faint); padding: 2px 0; }
+.priority-open, .panel-open { font-size: 10px; color: var(--accent); text-decoration: none; opacity: 0.6; margin-left: 4px; flex-shrink: 0; }
+.priority-open:hover, .panel-open:hover { opacity: 1; }
+.task-link-name a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--accent); }
+.ready-pill, .blocked-pill { font-size: 10px; padding: 1px 7px; border-radius: 10px; font-weight: 600; }
+.ready-pill { background: var(--working-bg); color: var(--green); }
+.blocked-pill { background: var(--review-bg); color: var(--orange); }
 
 /* Filter bar */
 .filter-bar {
@@ -3380,8 +3988,12 @@ body {
 <body>
 
 <div class="header">
-    <div>
+    <div style="display:flex;align-items:center">
         <h1><span>Claude</span> Sessions</h1>
+        <div class="tabs">
+            <a class="tab active" id="tabBoard" href="#board">Board</a>
+            <a class="tab" id="tabTasks" href="#tasks">Tasks<span class="tab-count" id="tabTasksCount"></span></a>
+        </div>
     </div>
     <div class="legend">
         <span class="legend-item"><span class="legend-dot working"></span>Waiting on AI</span>
@@ -3394,6 +4006,7 @@ body {
     </button>
 </div>
 
+<div id="boardView">
 <div id="prioritiesBar" class="priorities-bar"></div>
 <div id="panelsBar" class="panels-bar"></div>
 
@@ -3405,6 +4018,9 @@ body {
 </div>
 
 <div id="cardGridView" class="card-grid"></div>
+</div>
+<div id="tasksView" class="tasks-list" hidden></div>
+<div id="taskView" class="task-page" hidden></div>
 <div id="tagInputOverlay" class="tag-input-overlay" style="display:none"
      onclick="closeTagInput(event)"></div>
 
@@ -3446,6 +4062,44 @@ const PALETTE = ['purple','green','blue','red','orange','pink','teal','yellow'];
 
 let lastPrioritiesJson = null;
 let lastPanelsJson = null;
+
+// --- views: the board, the Tasks list, one task ---------------------------
+//
+// One page, three views, chosen by the hash so a task has a URL that can be
+// bookmarked or pasted: #board, #tasks, #task/<id>. The board keeps polling
+// underneath whichever view is showing, since its session list is what the
+// task page joins against.
+
+let view = {name: 'board', taskId: null};
+let lastTaskJson = null;
+let lastTasksJson = null;
+let taskData = null;
+
+function routeFromHash() {
+    const h = location.hash || '#board';
+    if (h.startsWith('#task/')) view = {name: 'task', taskId: Number(h.slice(6)) || null};
+    else if (h === '#tasks') view = {name: 'tasks', taskId: null};
+    else view = {name: 'board', taskId: null};
+    lastTaskJson = null;
+    lastTasksJson = null;
+    applyView();
+}
+window.addEventListener('hashchange', routeFromHash);
+
+function applyView() {
+    document.getElementById('boardView').hidden = view.name !== 'board';
+    document.getElementById('tasksView').hidden = view.name !== 'tasks';
+    document.getElementById('taskView').hidden = view.name !== 'task';
+    document.getElementById('tabBoard').classList.toggle('active', view.name === 'board');
+    document.getElementById('tabTasks').classList.toggle('active', view.name !== 'board');
+    if (view.name === 'tasks') fetchTasks(true);
+    if (view.name === 'task') fetchTask(true);
+}
+
+async function pollView() {
+    if (view.name === 'tasks') fetchTasks();
+    else if (view.name === 'task') fetchTask();
+}
 
 async function fetchSessions(force = false) {
     if (isEditing && !force) return;
@@ -3612,6 +4266,7 @@ function renderPriorities() {
         <span class="priority-check">${item.done ? '✓' : '○'}</span>
         <span class="priority-text">${escHtml(item.text)}</span>
         ${item.load ? `<span class="priority-load">${escHtml(item.load)}</span>` : ''}
+        ${live && item.id != null ? `<a class="priority-open" href="#task/${item.id}" onclick="event.stopPropagation()" title="Open the task page">↗</a>` : ''}
     </div>`;
 
     const renderWeek = (w, showMapBtn, idx) => {
@@ -3770,6 +4425,7 @@ function renderPanels() {
         title="${escAttr(item.key || item.text)}">
         <span class="panel-item-text">${escHtml(item.text)}</span>
         ${item.key ? `<span class="panel-item-key">${escHtml(item.key)}</span>` : ''}
+        ${item.id != null ? `<a class="panel-open" href="#task/${item.id}" onclick="event.stopPropagation()" title="Open the task page">↗</a>` : ''}
         ${actions}
     </div>`;
 
@@ -3789,7 +4445,7 @@ function renderPanels() {
     const projects = panels.projects.map(p => `<div class="panel-item">
         <span class="panel-item-text">
             <strong>${escHtml(p.name)}</strong>
-            ${p.next ? `<br><span class="panel-next" draggable="true" data-id="${p.next.id}" ondragstart="dragTaskStart(event)">${escHtml(p.next.text)}</span>`
+            ${p.next ? `<br><span class="panel-next" draggable="true" data-id="${p.next.id}" ondragstart="dragTaskStart(event)">${escHtml(p.next.text)}</span><a class="panel-open" href="#task/${p.next.id}" onclick="event.stopPropagation()" title="Open the task page">↗</a>`
                      : '<br><span class="panel-empty">no next action</span>'}
         </span>
         <span class="panel-item-key">${p.openCount} open${p.status !== 'active' ? ' · ' + escHtml(p.status) : ''}</span>
@@ -3985,7 +4641,7 @@ function renderCard(s) {
                 : '';
             linkHtml = `<div class="task-link-info">
                  <span class="task-link-change" onclick="event.stopPropagation();openTaskLink('${s.itermId}')" title="Change">&#x21D7;</span>
-                 <span class="task-link-name">${escHtml(s.taskList?.projectName || '')} → ${escHtml(ta.taskTitle)} ${taskLink}</span>
+                 <span class="task-link-name">${escHtml(s.taskList?.projectName || '')} → ${ta.taskId ? `<a href="#task/${ta.taskId}" onclick="event.stopPropagation()" title="Open the task page">${escHtml(ta.taskTitle)}</a>` : escHtml(ta.taskTitle)} ${taskLink}</span>
                  <span class="task-link-remove" onclick="event.stopPropagation();unlinkTask('${s.itermId}')" title="Remove">×</span>
                </div>`;
         } else if (s.taskList) {
@@ -4442,7 +5098,7 @@ async function selectTaskFile(itermId, path) {
         const statusCls = t.status.toLowerCase().replace(/\s+/g, '-');
         const safeTitle = t.title.replace(/'/g, "\\'").replace(/"/g, '&quot;');
         const safeId = (t.notionTaskId || '').replace(/'/g, "\\'");
-        return `<div class="task-file-option" onclick="linkSpecificTask('${itermId}','${safePath}','${safeId}','${safeTitle}')">
+        return `<div class="task-file-option" onclick="linkSpecificTask('${itermId}','${safePath}','${safeId}','${safeTitle}',${t.id != null ? t.id : 'null'})">
             <div style="display:flex;align-items:center;gap:8px">
                 <span class="task-status-dot ${statusCls}" style="flex-shrink:0"></span>
                 <span style="font-size:13px">${escHtml(t.title)}</span>
@@ -4513,11 +5169,11 @@ async function createAndLinkTask(itermId, taskFile) {
     }
 }
 
-async function linkSpecificTask(itermId, taskFile, notionTaskId, taskTitle) {
+async function linkSpecificTask(itermId, taskFile, notionTaskId, taskTitle, taskId) {
     await fetch('/api/link-task', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({itermId, taskFile, notionTaskId, taskTitle})
+        body: JSON.stringify({itermId, taskFile, notionTaskId, taskTitle, taskId})
     });
     document.getElementById('tagInputOverlay').style.display = 'none';
     isEditing = false;
@@ -4623,9 +5279,280 @@ function escAttr(str) {
         .replace(/>/g, '&gt;');
 }
 
+// --- Tasks list ------------------------------------------------------------
+
+async function fetchTasks(force = false) {
+    try {
+        const res = await fetch('/api/tasks');
+        const data = await res.json();
+        const json = JSON.stringify(data);
+        const count = document.getElementById('tabTasksCount');
+        if (count) count.textContent = data.tasks?.length ? ' ' + data.tasks.length : '';
+        if (!force && json === lastTasksJson) return;
+        lastTasksJson = json;
+        if (view.name === 'tasks') renderTasks(data);
+    } catch (e) {
+        console.error('tasks fetch failed', e);
+    }
+}
+
+function renderTasks(data) {
+    const el = document.getElementById('tasksView');
+    if (!data.available) { el.innerHTML = '<div class="task-empty">No store.</div>'; return; }
+    const rows = data.tasks || [];
+    if (!rows.length) {
+        el.innerHTML = '<div class="task-empty">Nothing in flight: no open task has a brief, an open question, an open dispatch, or a live conversation.</div>';
+        return;
+    }
+    const when = (t) => t.plannedDay ? shortDate(t.plannedDay) : (t.due ? 'due ' + shortDate(t.due) : '');
+    el.innerHTML = `<div class="tasks-head">${rows.length} in flight, ordered by when they bite. Everything else is reachable from a project on the board.</div>` +
+        rows.map(t => `<a class="tasks-row" href="#task/${t.id}">
+            <span class="tag">${escHtml(t.tag)}</span>
+            <span>${escHtml(t.title)}</span>
+            <span class="when">${escHtml(when(t))}</span>
+            <span class="qcount">${t.openQuestions ? t.openQuestions + ' to decide' : ''}</span>
+            <span class="dots">${'<span class="card-status working" title="live conversation"></span>'.repeat(Math.min(t.liveConversations || 0, 4))}${t.openDispatches ? '<span class="card-status ready" title="an agent has work out"></span>' : ''}</span>
+        </a>`).join('');
+}
+
+// --- One task ---------------------------------------------------------------
+
+async function fetchTask(force = false) {
+    if (!view.taskId) return;
+    try {
+        const res = await fetch('/api/task/' + view.taskId);
+        if (!res.ok) {
+            document.getElementById('taskView').innerHTML = '<div class="task-empty">No such task.</div>';
+            return;
+        }
+        const data = await res.json();
+        const json = JSON.stringify(data);
+        if (!force && json === lastTaskJson) return;
+        lastTaskJson = json;
+        taskData = data;
+        renderTask();
+    } catch (e) {
+        console.error('task fetch failed', e);
+    }
+}
+
+function shortDate(iso) {
+    if (!iso) return '';
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+    return m ? `${Number(m[2])}/${Number(m[3])}` : iso;
+}
+
+function shortStamp(ts) {
+    if (!ts) return '';
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(ts);
+    return m ? `${Number(m[2])}/${Number(m[3])} ${m[4]}:${m[5]}` : ts;
+}
+
+function renderTask() {
+    const el = document.getElementById('taskView');
+    if (!taskData) return;
+    // The poll must never destroy an open answer box. Ask the DOM, as the
+    // quick-add box does; flags have proved too easy to clear elsewhere.
+    if (el.querySelector('.answer-input')) return;
+    const d = taskData;
+    const t = d.task;
+    const brief = d.brief || {};
+    const hasBrief = !!(t.briefPath && brief.exists);
+
+    // Header
+    const meta = [];
+    meta.push(`<span class="status">${escHtml((t.status || '').replace('_', ' '))}</span>`);
+    if (t.plannedDay) meta.push('planned ' + shortDate(t.plannedDay));
+    if (t.due) meta.push('due ' + shortDate(t.due));
+    if (t.load) meta.push(escHtml(t.load));
+    meta.push(escHtml(t.owner === 'mq' ? 'MQ' : (t.owner || '')));
+    if (t.waitingOn) meta.push('waiting on ' + escHtml(t.waitingOn));
+    meta.push(d.dispatchReady
+        ? '<span class="ready-pill">dispatch-ready</span>'
+        : (hasBrief ? '<span class="blocked-pill">blocked on a question</span>' : ''));
+    const orcaLabel = hasBrief || t.briefPath ? 'Work on this with Orca' : 'Scope with Orca';
+    const actions = [
+        hasBrief ? `<a class="map-btn" href="${escAttr(brief.obsidianUrl)}">Open brief</a>` : '',
+        t.noteUrl ? `<a class="map-btn" href="${escAttr(t.noteUrl)}">Open note</a>` : '',
+        `<button class="map-btn primary" onclick="orcaOnTask(${t.id})">${orcaLabel}</button>`,
+        t.status !== 'done' ? `<button class="map-btn" onclick="taskDone(${t.id})">Done</button>` : '',
+    ].join('');
+
+    // Brief
+    let briefHtml;
+    if (!t.briefPath) {
+        briefHtml = `<div class="brief-missing">No brief yet. "Scope with Orca" runs /scope-and-start on this task.</div>`;
+    } else if (!brief.exists) {
+        briefHtml = `<div class="brief-missing">The brief is recorded at <code>${escHtml(t.briefPath)}</code> but the file is missing.</div>`;
+    } else {
+        const skip = new Set(['Task', 'Task ID', 'Dispatch-ready', 'Status']);
+        const header = Object.entries(brief.header || {})
+            .filter(([k]) => !skip.has(k))
+            .map(([k, v]) => `<span><b>${escHtml(k)}</b> ${escHtml(v)}</span>`).join('');
+        briefHtml = `<div class="brief-header">${header}</div>` +
+            (brief.goal ? `<div class="brief-section"><h4>Goal</h4>${escHtml(brief.goal)}</div>` : '') +
+            (brief.deliverables ? `<div class="brief-section"><h4>Deliverables</h4>${escHtml(brief.deliverables)}</div>` : '') +
+            (!brief.goal && !brief.deliverables ? '<div class="task-empty">The brief has no Goal or Deliverables section.</div>' : '');
+    }
+
+    // Needs you
+    const qRow = (q, project) => `<div class="q-row${project ? ' project' : ''}" id="q-${q.id}">
+        <span class="qid">Q${q.id}</span>
+        <div class="qbody">
+            <div>${escHtml(q.text)}</div>
+            <div class="qmeta">
+                ${q.proposed ? `Proposed: <b>${escHtml(q.proposed)}</b>` : '<span style="color:var(--orange)">no proposed answer</span>'}
+                ${q.blocks ? ` · ${escHtml(q.blocks)} has been blocked since ${shortDate(q.askedAt)}` : ` · asked by ${escHtml(q.askedBy)} ${shortDate(q.askedAt)}`}
+                ${project && q.task ? ` · <a href="#task/${q.taskId}" style="color:var(--accent)">${escHtml(q.task)}</a>` : ''}
+            </div>
+            <div class="answer-slot"></div>
+        </div>
+        <div class="qactions">
+            ${q.proposed ? `<button class="panel-btn" onclick="acceptQuestion(${q.id})">Accept</button>` : ''}
+            <button class="panel-btn" onclick="startAnswer(${q.id})">Answer</button>
+            ${hasBrief ? `<a class="panel-btn" href="${escAttr(brief.obsidianUrl)}">Brief ↗</a>` : ''}
+        </div>
+    </div>`;
+    const taskQs = (d.questions?.task || []);
+    const projQs = (d.questions?.project || []);
+    let needsHtml = taskQs.map(q => qRow(q, false)).join('')
+        || '<div class="task-empty">Nothing waiting on you here.</div>';
+    if (projQs.length) {
+        needsHtml += `<div class="q-rule">Elsewhere in ${escHtml(d.project?.name || d.project?.key || 'this project')}</div>`
+            + projQs.map(q => qRow(q, true)).join('');
+    }
+
+    // Conversations
+    const convs = d.conversations || [];
+    const convHtml = convs.map(c => {
+        const who = c.actor ? c.actor : (c.kind === 'scheduled' ? 'sweep' : 'MQ');
+        const state = c.live ? (c.state || 'ready') : 'inactive';
+        return `<div class="conv-row${c.live ? '' : ' dead'}" onclick="openConversation('${escAttr(c.sessionId)}')" title="${c.live ? 'Focus the iTerm tab' : 'Resume in a new tab'}">
+            <span class="card-status ${state}"></span>
+            <span>${escHtml(c.name)}${c.isAutomation ? ' <span class="inactive-badge">scheduled</span>' : ''}${c.live ? '' : ' <span class="inactive-badge">inactive</span>'}</span>
+            <span class="who">${escHtml(who)}</span>
+            <span class="who">${escHtml(c.age || (c.lastSeen ? shortStamp(c.lastSeen) : ''))}</span>
+            ${c.lastEvent ? `<span class="last">${shortStamp(c.lastEvent.ts)} · ${escHtml(c.lastEvent.summary || c.lastEvent.kind)}</span>` : ''}
+        </div>`;
+    }).join('') || '<div class="task-empty">No conversation has touched this task. "Work on this with Orca" opens one.</div>';
+
+    // Agents
+    const nextHtml = (d.next?.dispatches || []).map(e => `<div class="next-row">
+        <span class="who">${escHtml(e.agent || '?')}</span> since ${shortStamp(e.ts)}
+        ${e.artifactPath ? `<div class="path">→ ${escHtml(e.artifactPath)}</div>` : ''}
+    </div>`).join('') +
+        ((d.next?.waitingOn || []).length
+            ? `<div class="next-row">Waiting on your answer to ${d.next.waitingOn.map(id => `<a href="#q-${id}" style="color:var(--accent)">Q${id}</a>`).join(', ')}</div>`
+            : '') || '<div class="task-empty">Nothing out.</div>';
+    const doneHtml = (d.events || []).map(e => `<div class="event-row">
+        <span class="when">${shortStamp(e.ts)}</span>
+        <span><span class="actor">${escHtml(e.actor)}</span> · <span class="kind">${escHtml(e.kind)}</span>${e.verdict ? ' ' + escHtml(e.verdict) : ''}: ${escHtml(e.summary || '')}${e.artifactUrl ? ` <a href="${escAttr(e.artifactUrl)}">${escHtml(e.artifactPath.split('/').pop())} ↗</a>` : ''}</span>
+    </div>`).join('') || '<div class="task-empty">No events yet.</div>';
+
+    el.innerHTML = `
+        <div class="task-head">
+            <span class="tag">${escHtml(t.tag)}</span>
+            <h2>${escHtml(t.title)}</h2>
+        </div>
+        <div class="task-meta">${meta.filter(Boolean).join('<span>·</span>')}</div>
+        <div class="task-actions">${actions}</div>
+        <div class="task-block"><h3>Brief${hasBrief ? ` <span class="hint">${escHtml(t.briefPath.split('/').pop())}</span>` : ''}</h3>${briefHtml}</div>
+        <div class="task-block"><h3>Needs you</h3>${needsHtml}</div>
+        <div class="task-block"><h3>Conversations</h3>${convHtml}</div>
+        <div class="task-block"><h3>Agents</h3>
+            <div class="agents-cols">
+                <div><h3>Next</h3>${nextHtml}</div>
+                <div><h3>Done${t.notePath ? ` <a class="hint" href="${escAttr(t.noteUrl)}" style="color:var(--accent)">history ↗</a>` : ''}</h3>${doneHtml}</div>
+            </div>
+        </div>`;
+}
+
+function startAnswer(qid) {
+    const row = document.getElementById('q-' + qid);
+    if (!row || row.querySelector('.answer-input')) return;
+    const slot = row.querySelector('.answer-slot');
+    slot.innerHTML = '<input class="answer-input" placeholder="Your answer, Enter to save, Esc to cancel">';
+    const input = slot.querySelector('input');
+    isEditing = true;
+    setTimeout(() => { isEditing = true; input.focus(); }, 0);
+    let closed = false;
+    const finish = async (save) => {
+        if (closed) return;
+        closed = true;
+        const answer = input.value.trim();
+        isEditing = false;
+        slot.innerHTML = '';
+        if (save && answer) await answerQuestion(qid, answer);
+    };
+    input.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    };
+    // Clicking away keeps what was typed rather than discarding it.
+    input.onblur = () => finish(true);
+}
+
+async function answerQuestion(qid, answer) {
+    const ok = await storeAction('question/answer', {id: qid, answer});
+    if (!ok) alert('Could not record the answer.');
+    fetchTask(true);
+    fetchTasks();
+}
+
+async function acceptQuestion(qid) {
+    const ok = await storeAction('question/accept', {id: qid});
+    if (!ok) alert('Could not accept: the question may have no proposed answer.');
+    fetchTask(true);
+    fetchTasks();
+}
+
+async function taskDone(id) {
+    await storeAction('task/done', {id});
+    fetchTask(true);
+    fetchSessions(true);
+}
+
+async function orcaOnTask(id) {
+    const res = await fetch('/api/task/orca', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({taskId: id})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) alert('Could not open a session. Is iTerm running?');
+    setTimeout(() => fetchTask(true), 4000);
+}
+
+async function openConversation(sessionId) {
+    const c = (taskData?.conversations || []).find(x => x.sessionId === sessionId);
+    if (!c) return;
+    if (c.live && c.itermId) {
+        const r = await fetch('/api/navigate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({itermId: c.itermId, claudeSessionId: c.sessionId,
+                                  cwd: c.cwd || '', displayName: c.name || ''})
+        });
+        const data = await r.json().catch(() => ({}));
+        if (data.resumed) setTimeout(() => fetchTask(true), 4000);
+        return;
+    }
+    const r = await fetch('/api/resume', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({claudeSessionId: c.sessionId, cwd: c.cwd || '', displayName: c.name || ''})
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!data.ok) alert('Could not resume. Is iTerm2 running?');
+    else setTimeout(() => fetchTask(true), 4000);
+}
+
 // Initial load + auto-refresh
+routeFromHash();
 fetchSessions();
+fetchTasks();
 setInterval(fetchSessions, 5000);
+setInterval(pollView, 5000);
 </script>
 </body>
 </html>

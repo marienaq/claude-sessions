@@ -1412,7 +1412,12 @@ def open_store(root=None, db_path=None, seed_settings=True):
         db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    # check_same_thread is off because a handle is only ever used from one
+    # thread at a time (the server is single-threaded; the CLI is one
+    # process), and a test that serves requests from a helper thread would
+    # otherwise trip the check on a handle it opened in the main one.
+    conn = sqlite3.connect(str(db_path), isolation_level=None,
+                           check_same_thread=False)
     conn.row_factory = sqlite3.Row
     if db_path != ":memory:":
         # WAL so the server, the CLI and the Friday job can write concurrently.
