@@ -506,6 +506,13 @@ def cmd_task_link(store, repo, args):
     return 0
 
 
+def cmd_task_unlink(store, repo, args):
+    task = resolve(store, args.task)
+    event = store.unlink_session(task["id"], actor=args.actor)
+    print(f"{tag(task)}  {event['summary']}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # question
 # ---------------------------------------------------------------------------
@@ -1047,15 +1054,18 @@ dispatch for the same agent; when Orca records on a subagent's behalf, pass
 `--agent <name>`. A task is **dispatch-ready** when it has a brief and no
 open question that blocks anyone; nothing sets that by hand.
 
-**Show this conversation on a task**
+**Say this conversation is about a task**
 
 ```
-mh task link aba-champions#37
+mh task link aba-champions#37 --actor orca
 ```
 
-Every `mh` write already records which Claude conversation made it (see
-`mh session show`), so this is only needed for a conversation that has not
-written anything yet.
+Run it as the first thing when you start work on a task. The task page
+lists a conversation only when it has been linked: every `mh` write records
+which conversation made it (see `mh session show`), but writing to a task
+is not the same as being about it, and a capture sweep writes to many. The
+linked conversation is also what "Work on this with Orca" resumes.
+`mh task unlink` takes it back.
 
 ## Safety
 
@@ -1203,9 +1213,13 @@ def build_parser():
     p.add_argument("--summary", help="one line for the task page")
     p.set_defaults(fn=cmd_task_review)
 
-    p = task.add_parser("link", help="show this conversation on the task's page", parents=[common])
+    p = task.add_parser("link", help="this conversation is about the task; run it when you start work", parents=[common])
     p.add_argument("task")
     p.set_defaults(fn=cmd_task_link)
+
+    p = task.add_parser("unlink", help="this conversation is no longer about the task", parents=[common])
+    p.add_argument("task")
+    p.set_defaults(fn=cmd_task_unlink)
 
     question = sub.add_parser("question", help="questions for MQ",
                               parents=[common]).add_subparsers(

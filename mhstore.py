@@ -55,7 +55,7 @@ SOURCES = ("manual", "capture", "planning", "agent", "migration")
 EVENT_KINDS = (
     "add", "status", "note", "plan", "done", "reopen", "confirm",
     "dispatch", "deliver", "review", "question", "answer",
-    "brief", "link", "project", "week", "update", "setting",
+    "brief", "link", "unlink", "project", "week", "update", "setting",
 )
 VERDICTS = ("pass", "pass-with-notes", "back")
 QUESTION_STATUSES = ("open", "answered", "withdrawn")
@@ -1136,6 +1136,49 @@ class Store:
             row = self.event(row["id"])
         return row
 
+    def unlink_session(self, task_id, actor="system", session_id=None,
+                       summary=None):
+        """
+        Say that a conversation is no longer about this task. The link event
+        stays; this one supersedes it, so the record keeps both facts.
+        """
+        sid = session_id or self.session.get("session_id")
+        if not sid:
+            raise StoreError("no session to unlink")
+        row = self.record_event(
+            task_id, "unlink", actor=actor,
+            summary=summary or "unlinked this conversation",
+            payload={"session_id": sid})
+        if sid != self.session.get("session_id"):
+            self.conn.execute("UPDATE events SET session_id = ? WHERE id = ?",
+                              (sid, row["id"]))
+            self._commit_if_top()
+            row = self.event(row["id"])
+        return row
+
+    def linked_sessions(self, task_id):
+        """
+        Session ids whose latest link/unlink event on the task is a link.
+
+        This is what "conversations on this task" means: a conversation is
+        about a task because someone said so (MQ from the dashboard, or the
+        skill that started work on it with `mh task link`), not because it
+        happened to write to it. A capture sweep writes to eight tasks and
+        is about none of them.
+        """
+        state = {}
+        for e in self.events(task_id=task_id, kind=("link", "unlink"),
+                             limit=None, newest_first=False):
+            sid = e["session_id"]
+            if not sid:
+                try:
+                    sid = json.loads(e["payload"] or "{}").get("session_id")
+                except ValueError:
+                    sid = None
+            if sid:
+                state[sid] = e["kind"] == "link"
+        return [sid for sid, linked in state.items() if linked]
+
     def last_review(self, task_id):
         rows = self.events(task_id=task_id, kind="review", limit=1)
         return rows[0] if rows else None
@@ -1322,6 +1365,9 @@ class Store:
             info["event_count"] = r["n"]
             info["last_event"] = dict(last) if last else None
             result.append(info)
+        linked = set(self.linked_sessions(task_id))
+        for info in result:
+            info["linked"] = info["session_id"] in linked
         return result
 
     # -- settings ----------------------------------------------------------

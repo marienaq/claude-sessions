@@ -806,7 +806,11 @@ def task_conversations(store, task, sessions_list, state):
             "source": source,
         })
 
+    # Linked only. A conversation is about a task because someone said so,
+    # not because it wrote to it; the writes are all in the timeline below.
     for info in store.sessions_for_task(task["id"]):
+        if not info.get("linked"):
+            continue
         add(info["session_id"], info.get("iterm_id"), "events", info,
             info.get("last_event"))
     for key, value in (state.get("taskAssignments") or {}).items():
@@ -885,23 +889,18 @@ def inflight_tasks(sessions_list=None, state=None):
     sessions_list = cached_sessions() if sessions_list is None else sessions_list
     state = load_store() if state is None else state
 
-    live_by_task = {}
     live_sids = {s.get("claudeSessionId") or s.get("sessionId")
                  for s in sessions_list if not s.get("isInactive")}
     live_sids.discard(None)
-    if live_sids:
-        marks = ",".join("?" * len(live_sids))
-        for row in store.conn.execute(
-                f"""SELECT task_id, COUNT(DISTINCT session_id) AS n FROM events
-                    WHERE session_id IN ({marks}) AND task_id IS NOT NULL
-                    GROUP BY task_id""", tuple(live_sids)):
-            live_by_task[row["task_id"]] = row["n"]
+    linked_by_task = {}
+    for row in store.conn.execute(
+            "SELECT DISTINCT task_id FROM events WHERE kind = 'link' AND task_id IS NOT NULL"):
+        linked_by_task[row["task_id"]] = set(store.linked_sessions(row["task_id"]))
     for key, value in (state.get("taskAssignments") or {}).items():
-        if key not in live_sids:
-            continue
         for link in assignment_list(value):
             if link.get("taskId"):
-                live_by_task[link["taskId"]] = live_by_task.get(link["taskId"], 0) + 1
+                linked_by_task.setdefault(link["taskId"], set()).add(key)
+    live_by_task = {tid: len(sids & live_sids) for tid, sids in linked_by_task.items()}
 
     open_q = {}
     for q in store.questions():
@@ -940,28 +939,22 @@ def inflight_tasks(sessions_list=None, state=None):
 
 def find_task_session(store, task_id, max_age_days=14):
     """
-    The most recent conversation whose writes touched this task and whose
-    transcript is still on disk, or None. Resuming it beats starting fresh:
-    the agent still holds what it read and why it did what it did.
+    The most recently linked conversation whose transcript is still on
+    disk, or None. Linked, not "wrote to": a capture sweep writes to many
+    tasks and is about none of them, and resuming it would put MQ in a
+    conversation about nothing in particular.
     """
     cutoff = time.time() - max_age_days * 86400
-    # A capture sweep writes to many tasks in one run; resuming that
-    # transcript would put MQ in a conversation about nothing in particular.
-    # Scheduled sessions and sessions whose only writes here were capture or
-    # migration are skipped; a conversation someone linked on purpose wins.
+    linked = set(store.linked_sessions(task_id))
+    if not linked:
+        return None
     for row in store.conn.execute(
-            """SELECT e.session_id, MAX(e.ts) AS last,
-                      MAX(e.kind = 'link') AS linked,
-                      SUM(e.actor NOT IN ('capture', 'migration')) AS real_writes,
-                      s.kind AS skind
-               FROM events e LEFT JOIN sessions s ON s.session_id = e.session_id
-               WHERE e.task_id = ? AND e.session_id IS NOT NULL
-               GROUP BY e.session_id ORDER BY linked DESC, last DESC""", (task_id,)):
-        if row["skind"] == "scheduled":
-            continue
-        if not row["linked"] and not row["real_writes"]:
-            continue
+            """SELECT session_id, MAX(ts) AS last FROM events
+               WHERE task_id = ? AND kind = 'link' AND session_id IS NOT NULL
+               GROUP BY session_id ORDER BY last DESC""", (task_id,)):
         sid = row["session_id"]
+        if sid not in linked:
+            continue
         for jsonl in CLAUDE_PROJECTS_DIR.glob(f"*/{sid}.jsonl"):
             try:
                 if jsonl.stat().st_mtime >= cutoff:
@@ -1001,6 +994,12 @@ def task_orca_prompt(store, task, resuming=False):
         "always with `--actor orca`, and ask me nothing that you can propose "
         "an answer to instead.",
     ]
+    if not resuming:
+        lines[1:1] = [
+            "Before anything else, so the session manager shows this "
+            f"conversation on the task: `./operations/mh task link {tag} --actor orca`",
+            "",
+        ]
     return "\n".join(lines)
 
 
@@ -2450,8 +2449,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         elif self.path == "/api/task/unlink":
-            # Take one task off a card. The link event on the task stays:
-            # the record says the conversation was about it once.
+            # Take one task off a card, and say so on the task: an unlink
+            # event supersedes the link, so the page stops listing it.
             body = self.read_body()
             state = load_store()
             key = canonical_key(body.get("itermId", ""))
@@ -2468,6 +2467,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 assignments.pop(key, None)
             save_store(state)
+            store = get_store()
+            sid = key if len(key) == 36 and key.count("-") == 4 else None
+            if store is not None and sid and store.task(task_id):
+                try:
+                    store.unlink_session(task_id, actor="mq", session_id=sid)
+                except mhstore.StoreError as exc:
+                    print(f"unlink event failed: {exc}")
             self.send_json({"ok": True, "remaining": len(remaining)})
             return
 
@@ -5552,7 +5558,7 @@ function renderTask() {
             <span class="who">${escHtml(c.age || (c.lastSeen ? shortStamp(c.lastSeen) : ''))}</span>
             ${c.lastEvent ? `<span class="last">${shortStamp(c.lastEvent.ts)} · ${escHtml(c.lastEvent.summary || c.lastEvent.kind)}</span>` : ''}
         </div>`;
-    }).join('') || '<div class="task-empty">No conversation has touched this task. "Work on this with Orca" opens one.</div>';
+    }).join('') || '<div class="task-empty">No conversation is linked to this task. Writes from other sessions are in the timeline below; "Work on this with Orca" opens one that is.</div>';
     const convPick = `<div class="conv-pick" id="convPick"><button class="panel-btn" onclick="showConversationPicker(${t.id})">+ link a conversation</button></div>`;
 
     // Agents

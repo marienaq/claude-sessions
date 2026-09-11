@@ -54,7 +54,8 @@ works as-is.
 | `mh task dispatch <task>` | `--expect` `--summary` `--to` | record that work went to an agent |
 | `mh task deliver <task>` | `--agent` `--artifact` `--summary` | record a deliverable; closes the open dispatch |
 | `mh task review <task>` | `--agent` `--findings` `--summary` `--verdict` | record a reviewer's verdict |
-| `mh task link <task>` | — | show this conversation on the task's page |
+| `mh task link <task>` | — | this conversation is about the task; run it when you start work |
+| `mh task unlink <task>` | — | this conversation is no longer about the task |
 
 ### `mh question`
 
@@ -189,15 +190,18 @@ dispatch for the same agent; when Orca records on a subagent's behalf, pass
 `--agent <name>`. A task is **dispatch-ready** when it has a brief and no
 open question that blocks anyone; nothing sets that by hand.
 
-**Show this conversation on a task**
+**Say this conversation is about a task**
 
 ```
-mh task link aba-champions#37
+mh task link aba-champions#37 --actor orca
 ```
 
-Every `mh` write already records which Claude conversation made it (see
-`mh session show`), so this is only needed for a conversation that has not
-written anything yet.
+Run it as the first thing when you start work on a task. The task page
+lists a conversation only when it has been linked: every `mh` write records
+which conversation made it (see `mh session show`), but writing to a task
+is not the same as being about it, and a capture sweep writes to many. The
+linked conversation is also what "Work on this with Orca" resumes.
+`mh task unlink` takes it back.
 
 ## Safety
 

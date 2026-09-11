@@ -327,6 +327,23 @@ class TestAgentRecord(StoreCase):
         self.assertEqual([c["session_id"] for c in convs], [FAKE_SESSION["session_id"]])
         self.assertEqual(convs[0]["last_event"]["kind"], "link")
 
+    def test_unlink_supersedes_link_and_keeps_both(self):
+        tid = self.task["id"]
+        self.store.link_session(tid, actor="mq")
+        self.assertEqual(self.store.linked_sessions(tid), [FAKE_SESSION["session_id"]])
+        self.store.unlink_session(tid, actor="mq")
+        self.assertEqual(self.store.linked_sessions(tid), [])
+        kinds = [e["kind"] for e in self.events(task_id=tid, kind=("link", "unlink"))]
+        self.assertEqual(kinds, ["link", "unlink"])
+        self.assertFalse(self.store.sessions_for_task(tid)[0]["linked"])
+        self.store.link_session(tid, actor="mq")
+        self.assertEqual(self.store.linked_sessions(tid), [FAKE_SESSION["session_id"]])
+
+    def test_writing_to_a_task_does_not_link_it(self):
+        self.store.dispatch(self.task["id"], "iddy", actor="orca")
+        self.assertEqual(self.store.linked_sessions(self.task["id"]), [])
+        self.assertFalse(self.store.sessions_for_task(self.task["id"])[0]["linked"])
+
     def test_link_on_behalf_of_another_session(self):
         ev = self.store.link_session(self.task["id"], actor="mq",
                                      session_id="other-sid", iterm_id="OTHER")
@@ -548,6 +565,9 @@ class TestVerbs(StoreCase):
         code, out = self.run_cli("task", "link", "proj#1", "--actor", "mq")
         self.assertEqual(code, 0, out)
         self.assertIn("linked", out)
+        code, out = self.run_cli("task", "unlink", "proj#1", "--actor", "mq")
+        self.assertEqual(code, 0, out)
+        self.assertIn("unlinked", out)
         code, out = self.run_cli("session", "show")
         self.assertEqual(code, 0, out)
 
@@ -562,7 +582,7 @@ class TestReferenceAndChecker(unittest.TestCase):
     def test_committed_reference_includes_the_new_verbs(self):
         text = (Path(__file__).resolve().parent.parent / "mh-reference.md").read_text()
         for verb in ("mh task dispatch", "mh task deliver", "mh task review",
-                     "mh task link", "mh question add", "mh question answer",
+                     "mh task link", "mh task unlink", "mh question add", "mh question answer",
                      "mh question accept", "mh question list", "mh session show"):
             self.assertIn(verb, text)
 

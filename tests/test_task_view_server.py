@@ -66,6 +66,7 @@ class TaskViewCase(unittest.TestCase):
         self.q_proj = store.add_question("Owe a readout?", actor="capture",
                                          project_key="proj", proposed="no")
         store.dispatch(self.task["id"], "iddy", expect="proj/out.md", actor="orca")
+        store.link_session(self.task["id"], actor="orca")      # SID_A is about it
         store._session = {**mhsession.EMPTY, "session_id": SID_B, "kind": "scheduled",
                           "name": "sweep"}
         store._session_recorded = False     # a second process, in effect
@@ -158,20 +159,37 @@ class TestReadModel(TaskViewCase):
         self.assertFalse(d["brief"]["exists"])
         _, d = self.get(f"/api/task/{self.task['id']}")
 
-    def test_conversations_join_events_to_live_cards(self):
+    def test_conversations_are_the_linked_ones_joined_to_live_cards(self):
+        """SID_B wrote to the task but was never linked: timeline, not a conversation."""
         _, d = self.get(f"/api/task/{self.task['id']}")
         convs = {c["sessionId"]: c for c in d["conversations"]}
-        self.assertIn(SID_A, convs)
-        self.assertIn(SID_B, convs)
-        a, b = convs[SID_A], convs[SID_B]
+        self.assertEqual(set(convs), {SID_A})
+        a = convs[SID_A]
         self.assertTrue(a["live"])
         self.assertEqual(a["itermId"], "ITERM-A")
         self.assertEqual(a["state"], "ready")
-        self.assertEqual(a["lastEvent"]["kind"], "dispatch")
-        self.assertFalse(b["live"])
-        self.assertEqual(b["kind"], "scheduled")
-        self.assertEqual(b["actor"], "sweep")
+        self.assertEqual(a["lastEvent"]["kind"], "link")
+        self.assertIn(SID_B, [e["sessionId"] for e in d["events"]], "still in the timeline")
+
+    def test_a_scheduled_session_shows_once_linked(self):
+        store = self.server.get_store()
+        store.link_session(self.task["id"], actor="mq", session_id=SID_B)
+        _, d = self.get(f"/api/task/{self.task['id']}")
+        convs = {c["sessionId"]: c for c in d["conversations"]}
+        self.assertIn(SID_B, convs)
+        self.assertEqual(convs[SID_B]["kind"], "scheduled")
+        self.assertEqual(convs[SID_B]["actor"], "sweep")
+        self.assertFalse(convs[SID_B]["live"])
         self.assertEqual(d["conversations"][0]["sessionId"], SID_A, "live first")
+
+    def test_unlink_hides_the_conversation(self):
+        store = self.server.get_store()
+        store.unlink_session(self.task["id"], actor="mq", session_id=SID_A)
+        _, d = self.get(f"/api/task/{self.task['id']}")
+        self.assertEqual(d["conversations"], [])
+        store.link_session(self.task["id"], actor="mq", session_id=SID_A)
+        _, d = self.get(f"/api/task/{self.task['id']}")
+        self.assertEqual([c["sessionId"] for c in d["conversations"]], [SID_A])
 
     def test_unknown_task_is_404(self):
         try:
@@ -256,7 +274,7 @@ class TestWrites(TaskViewCase):
         _, d = self.get(f"/api/task/{self.task['id']}")
         self.assertIn(SID_A, [c["sessionId"] for c in d["conversations"]])
 
-    def test_unlink_takes_one_task_off_and_keeps_the_event(self):
+    def test_unlink_takes_one_task_off_and_records_it(self):
         self.post("/api/task/link", {"itermId": SID_A, "taskId": self.task["id"]})
         self.post("/api/task/link", {"itermId": SID_A, "taskId": self.other["id"]})
         status, d = self.post("/api/task/unlink", {"itermId": SID_A, "taskId": self.task["id"]})
@@ -265,7 +283,11 @@ class TestWrites(TaskViewCase):
         state = json.loads((self.repo / ".state" / "sessions.json").read_text())
         self.assertEqual([a["taskId"] for a in state["taskAssignments"][SID_A]], [self.other["id"]])
         store = self.server.get_store()
-        self.assertTrue(store.events(task_id=self.task["id"], kind="link", limit=1))
+        self.assertTrue(store.events(task_id=self.task["id"], kind="link", limit=1), "history kept")
+        self.assertEqual(store.events(task_id=self.task["id"], limit=1)[0]["kind"], "unlink")
+        self.assertNotIn(SID_A, store.linked_sessions(self.task["id"]))
+        _, page = self.get(f"/api/task/{self.task['id']}")
+        self.assertEqual(page["conversations"], [])
         self.post("/api/task/unlink", {"itermId": SID_A, "taskId": self.other["id"]})
         state = json.loads((self.repo / ".state" / "sessions.json").read_text())
         self.assertNotIn(SID_A, state["taskAssignments"])
@@ -333,6 +355,7 @@ class TestOrcaLauncher(TaskViewCase):
         self.assertIn("proj#1", launch["prompt"])
         self.assertIn("worked on this task in this conversation before", launch["prompt"])
         self.assertIn("proj/brief.md", launch["prompt"])
+        self.assertNotIn("mh task link", launch["prompt"], "a resumed conversation is already linked")
 
     def test_fresh_when_no_transcript_is_recent(self):
         self._transcript(SID_A, age_days=30)
@@ -342,18 +365,22 @@ class TestOrcaLauncher(TaskViewCase):
         self.assertIsNone(launch["resume"])
         self.assertIn("Read these first", launch["prompt"])
 
-    def test_capture_only_and_scheduled_sessions_are_not_resumed(self):
+    def test_only_a_linked_conversation_is_resumed(self):
         """A sweep writes to many tasks; its transcript is about none of them."""
         sid_c = "cccccccc-1111-2222-3333-444444444444"
         store = self.server.get_store()
         store._session = {**mhsession.EMPTY, "session_id": sid_c, "kind": "interactive"}
         store._session_recorded = False
-        store.update_task(self.task["id"], actor="capture", notes="swept")
+        store.dispatch(self.task["id"], "iddy", actor="orca")     # wrote, never linked
         self._transcript(SID_A, age_days=2)
-        self._transcript(SID_B, age_days=1)      # scheduled
-        self._transcript(sid_c, age_days=0)      # newest, but capture only
+        self._transcript(SID_B, age_days=1)      # scheduled, wrote, never linked
+        self._transcript(sid_c, age_days=0)      # newest write, never linked
         status, d = self.post("/api/task/orca", {"taskId": self.task["id"]})
         self.assertEqual(d["resumed"], SID_A)
+        store.unlink_session(self.task["id"], actor="mq", session_id=SID_A)
+        _, d = self.post("/api/task/orca", {"taskId": self.task["id"]})
+        self.assertIsNone(d["resumed"], "nothing linked means a fresh conversation")
+        self.assertIn("mh task link proj#1 --actor orca", self.launched[-1]["prompt"])
 
     def test_linked_conversation_wins_over_a_newer_write(self):
         sid_l = "dddddddd-1111-2222-3333-444444444444"
