@@ -809,8 +809,8 @@ def task_conversations(store, task, sessions_list, state):
     for info in store.sessions_for_task(task["id"]):
         add(info["session_id"], info.get("iterm_id"), "events", info,
             info.get("last_event"))
-    for key, link in (state.get("taskAssignments") or {}).items():
-        if isinstance(link, dict) and link.get("taskId") == task["id"]:
+    for key, value in (state.get("taskAssignments") or {}).items():
+        if any(link.get("taskId") == task["id"] for link in assignment_list(value)):
             card = by_sid.get(key)
             if card:
                 add(key, card.get("itermId"), "link", None, None)
@@ -896,9 +896,12 @@ def inflight_tasks(sessions_list=None, state=None):
                     WHERE session_id IN ({marks}) AND task_id IS NOT NULL
                     GROUP BY task_id""", tuple(live_sids)):
             live_by_task[row["task_id"]] = row["n"]
-    for key, link in (state.get("taskAssignments") or {}).items():
-        if isinstance(link, dict) and link.get("taskId") and key in live_sids:
-            live_by_task[link["taskId"]] = live_by_task.get(link["taskId"], 0) + 1
+    for key, value in (state.get("taskAssignments") or {}).items():
+        if key not in live_sids:
+            continue
+        for link in assignment_list(value):
+            if link.get("taskId"):
+                live_by_task[link["taskId"]] = live_by_task.get(link["taskId"], 0) + 1
 
     open_q = {}
     for q in store.questions():
@@ -1097,9 +1100,9 @@ def match_priority_to_session(item, session, task_assignments):
     if notion_id:
         # Exact ID match against this session's task assignment
         iterm_id = session.get("itermId", "")
-        assignment = task_assignments.get(iterm_id, {})
-        assigned_id = assignment.get("notionTaskId", "").replace("-", "")
-        return assigned_id == notion_id.replace("-", "")
+        wanted = notion_id.replace("-", "")
+        return any((a.get("notionTaskId") or "").replace("-", "") == wanted
+                   for a in assignment_list(task_assignments.get(iterm_id)))
 
     # Fallback: fuzzy keyword matching
     item_lower = item.get("text", "").lower()
@@ -1408,6 +1411,19 @@ def discover_inactive_sessions(active_claude_ids):
     return results[:INACTIVE_MAX]
 
 
+def assignment_list(value):
+    """
+    A card's task links as a list. The slot held one dict per card until
+    the task view; a conversation is about several tasks often enough that
+    it is a list now, and old single entries read as a list of one.
+    """
+    if not value:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    return [v for v in value if isinstance(v, dict)]
+
+
 def lookup_state(category_map, claude_session_id, iterm_id, default=None):
     """Prefer claudeSessionId, fall back to itermId."""
     if claude_session_id and claude_session_id in category_map:
@@ -1489,7 +1505,8 @@ def build_inactive_card(inactive, store):
         "priorityLabel": priority_label,
         "nextStepOverride": store.get("nextSteps", {}).get(sid, ""),
         "needsReview": False,
-        "taskAssignment": store.get("taskAssignments", {}).get(sid),
+        "taskAssignments": assignment_list(store.get("taskAssignments", {}).get(sid)),
+        "taskAssignment": (assignment_list(store.get("taskAssignments", {}).get(sid)) or [None])[0],
         "todo": todo,
     }
 
@@ -1505,8 +1522,15 @@ def resolve_task_assignments(state):
     if store is None:
         return False
     changed = False
-    for key, link in (state.get("taskAssignments") or {}).items():
-        if not isinstance(link, dict) or "taskId" in link:
+    assignments = state.get("taskAssignments") or {}
+    for key, value in list(assignments.items()):
+        if isinstance(value, dict):
+            assignments[key] = [value]       # the slot is a list now
+            changed = True
+    links = [link for value in assignments.values()
+             for link in assignment_list(value)]
+    for link in links:
+        if "taskId" in link:
             continue
         notion = (link.get("notionTaskId") or "").replace("-", "").lower()
         task = None
@@ -2000,7 +2024,8 @@ def get_all_sessions():
         priority_label = "" if priority_label_raw == "__cleared__" else priority_label_raw
         next_step_override = lookup_state(store.get("nextSteps", {}), session_id, iterm["itermId"], "")
 
-        task_assignment = lookup_state(store.get("taskAssignments", {}), session_id, iterm["itermId"])
+        task_assignments = assignment_list(
+            lookup_state(store.get("taskAssignments", {}), session_id, iterm["itermId"]))
         # Todo file: prefer one keyed by claudeSessionId
         todo = read_todo(session_id) if session_id else None
         if not todo:
@@ -2032,7 +2057,8 @@ def get_all_sessions():
             "priorityLabel": priority_label,
             "nextStepOverride": next_step_override,
             "needsReview": needs_review,
-            "taskAssignment": task_assignment,
+            "taskAssignments": task_assignments,
+            "taskAssignment": task_assignments[0] if task_assignments else None,
             "todo": todo,
         })
 
@@ -2400,12 +2426,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             path = (str(MELLONHEAD_ROOT / project["dir"] / "task-list.md")
                     if project.get("dir") else "")
             assignments = state.setdefault("taskAssignments", {})
-            assignments[key] = {
+            current = [a for a in assignment_list(assignments.get(key))
+                       if a.get("taskId") != task["id"]]
+            current.append({
                 "taskFile": path, "notionTaskId": task["notion_task_id"] or "",
                 "taskTitle": task["title"], "taskId": task["id"],
                 "projectKey": task["project_key"],
-            }
-            if path:
+            })
+            assignments[key] = current
+            if path and state.get("taskLinks", {}).get(key) in (None, "__none__"):
                 state.setdefault("taskLinks", {})[key] = path
             save_store(state)
             iterm_id = next((s.get("itermId") for s in cached_sessions()
@@ -2418,6 +2447,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, 400)
                 return
             self.send_json({"ok": True, "taskId": task["id"]})
+            return
+
+        elif self.path == "/api/task/unlink":
+            # Take one task off a card. The link event on the task stays:
+            # the record says the conversation was about it once.
+            body = self.read_body()
+            state = load_store()
+            key = canonical_key(body.get("itermId", ""))
+            try:
+                task_id = int(body.get("taskId"))
+            except (TypeError, ValueError):
+                self.send_json({"ok": False, "error": "Bad taskId"}, 400)
+                return
+            assignments = state.setdefault("taskAssignments", {})
+            remaining = [a for a in assignment_list(assignments.get(key))
+                         if a.get("taskId") != task_id]
+            if remaining:
+                assignments[key] = remaining
+            else:
+                assignments.pop(key, None)
+            save_store(state)
+            self.send_json({"ok": True, "remaining": len(remaining)})
             return
 
         elif self.path == "/api/task/orca":
@@ -2810,7 +2861,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if Path(expanded).exists():
                         links[iterm_id] = expanded
                         if notion_task_id or body.get("taskId"):
-                            assignments[iterm_id] = {
+                            entry = {
                                 "taskFile": expanded,
                                 "notionTaskId": notion_task_id,
                                 "taskTitle": task_title,
@@ -2830,8 +2881,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         if (row["notion_task_id"] or "").replace("-", "").lower() == wanted:
                                             linked = row
                                             break
-                            assignments[iterm_id]["taskId"] = linked["id"] if linked else None
-                            assignments[iterm_id]["projectKey"] = linked["project_key"] if linked else None
+                            entry["taskId"] = linked["id"] if linked else None
+                            entry["projectKey"] = linked["project_key"] if linked else None
+                            # One card, several tasks: add rather than replace.
+                            current = [a for a in assignment_list(assignments.get(iterm_id))
+                                       if not (linked is not None and a.get("taskId") == linked["id"])
+                                       and not (linked is None and a.get("taskTitle") == task_title)]
+                            current.append(entry)
+                            assignments[iterm_id] = current
                             if linked is not None:
                                 sid = iterm_id if len(iterm_id) == 36 and iterm_id.count("-") == 4 else None
                                 try:
@@ -2840,8 +2897,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                                             iterm_id=body.get("itermId", ""))
                                 except Exception as exc:      # noqa: BLE001
                                     print(f"link event failed: {exc}")
-                        else:
-                            assignments.pop(iterm_id, None)
+                        # "Link project only" leaves the task links alone;
+                        # "__none__" above is what clears them.
                         save_store(store)
                         # Auto-init todo file with Notion metadata
                         todo = read_todo(iterm_id)
@@ -3172,6 +3229,7 @@ body {
 .priority-open, .panel-open { font-size: 10px; color: var(--accent); text-decoration: none; opacity: 0.6; margin-left: 4px; flex-shrink: 0; }
 .priority-open:hover, .panel-open:hover { opacity: 1; }
 .task-link-name a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--accent); }
+.task-link-row { margin-top: -4px; padding-left: 18px; }
 .ready-pill, .blocked-pill { font-size: 10px; padding: 1px 7px; border-radius: 10px; font-weight: 600; }
 .ready-pill { background: var(--working-bg); color: var(--green); }
 .blocked-pill { background: var(--review-bg); color: var(--orange); }
@@ -4606,7 +4664,12 @@ function renderCard(s) {
         } else {
             // Fall back to assigned task or task list
             let ns = null;
-            if (s.taskAssignment?.notionTaskId && s.taskList?.tasks) {
+            const linkedIds = (s.taskAssignments || []).map(a => a.taskId).filter(Boolean);
+            if (linkedIds.length && s.taskList?.tasks) {
+                // The first linked task that is still open is this card's next step.
+                ns = s.taskList.tasks.find(t => linkedIds.includes(t.id) && t.status.toLowerCase() !== 'done')
+                    || s.taskList?.nextStep || null;
+            } else if (s.taskAssignment?.notionTaskId && s.taskList?.tasks) {
                 const assignedId = s.taskAssignment.notionTaskId.replace(/-/g,'');
                 ns = s.taskList.tasks.find(t => (t.notionTaskId||'').replace(/-/g,'') === assignedId);
                 if (ns && ns.status.toLowerCase() === 'done') ns = s.taskList?.nextStep || null;
@@ -4664,24 +4727,31 @@ function renderCard(s) {
                </div>`
             : '';
 
-        // Link task — show assignment (project + task) or just project, or link button
+        // Link rows: the project, then one row per linked task. A card can be
+        // about several tasks; each has its own ×, and the project's × clears
+        // the whole link.
         let linkHtml;
-        if (s.taskAssignment) {
-            const ta = s.taskAssignment;
-            const taskLink = ta.notionTaskId
-                ? `<a class="notion-link" href="https://notion.so/${ta.notionTaskId.replace(/-/g,'')}" target="_blank" onclick="event.stopPropagation()">↗</a>`
-                : '';
+        const links = (s.taskAssignments || []).filter(a => a && (a.taskId || a.taskTitle));
+        if (s.taskList || links.length) {
+            const rows = links.map(ta => {
+                const notion = ta.notionTaskId
+                    ? `<a class="notion-link" href="https://notion.so/${ta.notionTaskId.replace(/-/g,'')}" target="_blank" onclick="event.stopPropagation()">↗</a>`
+                    : '';
+                const name = ta.taskId
+                    ? `<a href="#task/${ta.taskId}" onclick="event.stopPropagation();openTask(${ta.taskId})" title="Open the task">${escHtml(ta.taskTitle)}</a>`
+                    : escHtml(ta.taskTitle);
+                const remove = ta.taskId
+                    ? `<span class="task-link-remove" onclick="event.stopPropagation();unlinkOneTask('${s.itermId}',${ta.taskId})" title="Unlink this task">×</span>`
+                    : '';
+                return `<div class="task-link-info task-link-row">
+                     <span class="task-link-name">→ ${name} ${notion}</span>${remove}
+                   </div>`;
+            }).join('');
             linkHtml = `<div class="task-link-info">
-                 <span class="task-link-change" onclick="event.stopPropagation();openTaskLink('${s.itermId}')" title="Change">&#x21D7;</span>
-                 <span class="task-link-name">${escHtml(s.taskList?.projectName || '')} → ${ta.taskId ? `<a href="#task/${ta.taskId}" onclick="event.stopPropagation();openTask(${ta.taskId})" title="Open the task">${escHtml(ta.taskTitle)}</a>` : escHtml(ta.taskTitle)} ${taskLink}</span>
-                 <span class="task-link-remove" onclick="event.stopPropagation();unlinkTask('${s.itermId}')" title="Remove">×</span>
-               </div>`;
-        } else if (s.taskList) {
-            linkHtml = `<div class="task-link-info">
-                 <span class="task-link-change" onclick="event.stopPropagation();openTaskLink('${s.itermId}')" title="Change">&#x21D7;</span>
-                 <span class="task-link-name">${escHtml(s.taskList.projectName)}${s.isAutoLinked ? ' <span style="font-size:10px;color:var(--text-faint)">(auto)</span>' : ''}</span>
-                 <span class="task-link-remove" onclick="event.stopPropagation();unlinkTask('${s.itermId}')" title="Remove">×</span>
-               </div>`;
+                 <span class="task-link-change" onclick="event.stopPropagation();openTaskLink('${s.itermId}')" title="Link another task">&#x21D7;</span>
+                 <span class="task-link-name">${escHtml(s.taskList?.projectName || links[0]?.projectKey || '')}${s.isAutoLinked && !links.length ? ' <span style="font-size:10px;color:var(--text-faint)">(auto)</span>' : ''}</span>
+                 <span class="task-link-remove" onclick="event.stopPropagation();unlinkTask('${s.itermId}')" title="Remove all links">×</span>
+               </div>${rows}`;
         } else {
             linkHtml = `<div class="task-link-btn" onclick="event.stopPropagation();openTaskLink('${s.itermId}')">Link task list</div>`;
         }
@@ -5221,6 +5291,11 @@ async function linkProjectOnly(itermId, taskFile) {
     document.getElementById('tagInputOverlay').style.display = 'none';
     isEditing = false;
     fetchSessions();
+}
+
+async function unlinkOneTask(itermId, taskId) {
+    await storeAction('task/unlink', {itermId, taskId});
+    fetchSessions(true);
 }
 
 async function unlinkTask(itermId) {

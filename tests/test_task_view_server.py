@@ -235,7 +235,7 @@ class TestWrites(TaskViewCase):
         status, d = self.post("/api/task/link", {"itermId": SID_A, "taskId": self.task["id"]})
         self.assertEqual(status, 200, d)
         state = json.loads((self.repo / ".state" / "sessions.json").read_text())
-        link = state["taskAssignments"][SID_A]
+        link = state["taskAssignments"][SID_A][0]
         self.assertEqual(link["taskId"], self.task["id"])
         self.assertEqual(link["projectKey"], "proj")
         self.assertTrue(link["taskFile"].endswith("proj/task-list.md"))
@@ -243,6 +243,40 @@ class TestWrites(TaskViewCase):
         ev = store.events(task_id=self.task["id"], kind="link", limit=1)[0]
         self.assertEqual(ev["session_id"], SID_A)
         self.assertEqual(ev["actor"], "mq")
+
+    def test_a_card_can_link_several_tasks(self):
+        self.post("/api/task/link", {"itermId": SID_A, "taskId": self.task["id"]})
+        self.post("/api/task/link", {"itermId": SID_A, "taskId": self.other["id"]})
+        self.post("/api/task/link", {"itermId": SID_A, "taskId": self.task["id"]})   # again
+        state = json.loads((self.repo / ".state" / "sessions.json").read_text())
+        ids = [a["taskId"] for a in state["taskAssignments"][SID_A]]
+        self.assertEqual(sorted(ids), sorted([self.task["id"], self.other["id"]]), "no duplicates")
+        _, d = self.get(f"/api/task/{self.other['id']}")
+        self.assertIn(SID_A, [c["sessionId"] for c in d["conversations"]])
+        _, d = self.get(f"/api/task/{self.task['id']}")
+        self.assertIn(SID_A, [c["sessionId"] for c in d["conversations"]])
+
+    def test_unlink_takes_one_task_off_and_keeps_the_event(self):
+        self.post("/api/task/link", {"itermId": SID_A, "taskId": self.task["id"]})
+        self.post("/api/task/link", {"itermId": SID_A, "taskId": self.other["id"]})
+        status, d = self.post("/api/task/unlink", {"itermId": SID_A, "taskId": self.task["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(d["remaining"], 1)
+        state = json.loads((self.repo / ".state" / "sessions.json").read_text())
+        self.assertEqual([a["taskId"] for a in state["taskAssignments"][SID_A]], [self.other["id"]])
+        store = self.server.get_store()
+        self.assertTrue(store.events(task_id=self.task["id"], kind="link", limit=1))
+        self.post("/api/task/unlink", {"itermId": SID_A, "taskId": self.other["id"]})
+        state = json.loads((self.repo / ".state" / "sessions.json").read_text())
+        self.assertNotIn(SID_A, state["taskAssignments"])
+
+    def test_old_single_entry_reads_as_a_list(self):
+        self.assertEqual(self.server.assignment_list({"taskId": 3}), [{"taskId": 3}])
+        self.assertEqual(self.server.assignment_list([{"taskId": 3}, "junk"]), [{"taskId": 3}])
+        self.assertEqual(self.server.assignment_list(None), [])
+        state = {"taskAssignments": {"X": {"taskFile": "/x", "notionTaskId": "", "taskTitle": "t", "taskId": 1}}}
+        self.server.resolve_task_assignments(state)
+        self.assertIsInstance(state["taskAssignments"]["X"], list)
 
     def test_link_without_a_real_task_is_400(self):
         status, _ = self.post("/api/task/link", {"itermId": SID_A, "taskId": 999})
@@ -256,7 +290,7 @@ class TestWrites(TaskViewCase):
             "taskTitle": "Decide the scope", "taskId": self.task["id"]})
         self.assertEqual(status, 200, d)
         state = json.loads((self.repo / ".state" / "sessions.json").read_text())
-        link = state["taskAssignments"][SID_A]      # canonical key is the Claude id
+        link = state["taskAssignments"][SID_A][0]   # canonical key is the Claude id
         self.assertEqual(link["taskId"], self.task["id"])
         store = self.server.get_store()
         self.assertTrue(store.events(task_id=self.task["id"], kind="link", limit=1))
@@ -271,8 +305,8 @@ class TestWrites(TaskViewCase):
                   "taskTitle": "No such row"},
         }}
         self.assertTrue(self.server.resolve_task_assignments(state))
-        self.assertEqual(state["taskAssignments"]["X"]["taskId"], self.other["id"])
-        self.assertIsNone(state["taskAssignments"]["Y"]["taskId"])
+        self.assertEqual(state["taskAssignments"]["X"][0]["taskId"], self.other["id"])
+        self.assertIsNone(state["taskAssignments"]["Y"][0]["taskId"])
         self.assertFalse(self.server.resolve_task_assignments(state), "not retried")
 
 
