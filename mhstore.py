@@ -1442,31 +1442,62 @@ def open_store(root=None, db_path=None, seed_settings=True):
     return store
 
 
+def audit_key(ts, actor, action, task_id, before, after):
+    """What makes an audit line the same fact as an event row."""
+    return (ts, (actor or "system").strip().lower() or "system", action,
+            task_id, json.dumps(before, sort_keys=True, ensure_ascii=False),
+            json.dumps(after, sort_keys=True, ensure_ascii=False))
+
+
 def migrate_schema(store):
     """
-    Bring a v1 file up to v2, once.
+    Bring the file up to date, and keep events in step with the audit log.
 
-    The tables themselves are CREATE IF NOT EXISTS, so the only work is to
-    backfill `events` from the audit lines that predate the table, with the
-    kind read off each line's diff. Nothing else is inferred: a dispatch that
-    only ever lived in a note file stays there until the backfill script
-    (or the next sweep) records it properly.
+    The tables are CREATE IF NOT EXISTS, so the only real work is syncing
+    `events` from the audit lines that have no row yet. That is keyed on
+    content rather than on "the table is empty": a v1 writer that keeps
+    appending audit lines after the tables exist (the live manager during
+    the dual-live window) must not leave a hole at cutover. The check is a
+    line count against a row count; both are cheap.
     """
     conn = store.conn
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version >= SCHEMA_VERSION:
-        return False
-    if version < 2:
-        have_events = conn.execute("SELECT 1 FROM events LIMIT 1").fetchone()
-        if not have_events and store.audit_log.exists():
-            backfill_events_from_audit(store)
-    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    return True
+    synced = 0
+    if store.audit_log.exists():
+        try:
+            with open(store.audit_log, "rb") as f:
+                lines = sum(1 for line in f if line.strip())
+        except OSError:
+            lines = 0
+        rows = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        if version < SCHEMA_VERSION or lines > rows:
+            synced = sync_events_from_audit(store)
+    if version < SCHEMA_VERSION:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    return synced
 
 
-def backfill_events_from_audit(store):
-    """One event row per audit line. Returns how many were written."""
+def sync_events_from_audit(store):
+    """
+    One event row for every audit line that has none. Returns the count.
+
+    Matching is on (ts, actor, action, task_id, before, after), as a
+    multiset: two identical lines in the log get two rows. Nothing beyond
+    the line is inferred, and rows are never removed.
+    """
+    from collections import Counter
+
     conn = store.conn
+    have = Counter()
+    for row in conn.execute("SELECT ts, actor, task_id, payload FROM events"):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        have[audit_key(row["ts"], row["actor"], payload.get("action"),
+                       row["task_id"], payload.get("before"),
+                       payload.get("after"))] += 1
+
     n = 0
     conn.execute("BEGIN")
     try:
@@ -1481,15 +1512,22 @@ def backfill_events_from_audit(store):
                     continue
                 action = rec.get("action") or "unknown"
                 before, after = rec.get("before"), rec.get("after")
-                kind = event_kind(action, before, after)
                 task_id = rec.get("task_id")
+                key = audit_key(rec.get("ts"), rec.get("actor"), action,
+                                task_id, before, after)
+                if have[key] > 0:
+                    have[key] -= 1
+                    continue
+                kind = event_kind(action, before, after)
                 project_key = None
                 if task_id is not None:
                     row = conn.execute("SELECT project_key FROM tasks WHERE id = ?",
                                        (task_id,)).fetchone()
-                    project_key = row["project_key"] if row else (
-                        (after or {}).get("project") if isinstance(after, dict) else None)
-                    if row is None:
+                    if row:
+                        project_key = row["project_key"]
+                    else:
+                        if isinstance(after, dict):
+                            project_key = after.get("project")
                         task_id = None      # the row is gone; keep the line, drop the FK
                 elif action.startswith("project.") and isinstance(after, dict):
                     project_key = after.get("key")

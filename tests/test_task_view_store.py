@@ -172,6 +172,33 @@ class TestMigration(unittest.TestCase):
             self.assertEqual(len(store.events(limit=None)), 4, "backfill must not repeat")
             store.close()
 
+    def test_lines_written_by_a_v1_writer_are_picked_up(self):
+        """
+        During the dual-live window the live manager keeps appending audit
+        lines with no event rows. Reopening must fill the gap, once.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = mhstore.open_store(root=root)
+            store._session = dict(mhsession.EMPTY)
+            store.add_project("proj", "P", dir="proj")
+            t = store.add_task("proj", "Row", display_ord="1")
+            store.close()
+            line = json.dumps({"ts": "2026-09-10T18:30:00", "actor": "Orca",
+                               "action": "task.update", "task_id": t["id"],
+                               "before": {"status": "backlog"},
+                               "after": {"status": "review"}})
+            with open(root / "operations" / "tasks-audit.log", "a") as f:
+                f.write(line + "\n" + line + "\n")     # two identical lines
+            store = mhstore.open_store(root=root)
+            rows = store.events(task_id=t["id"], kind="status", limit=None)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["actor"], "orca")
+            store.close()
+            store = mhstore.open_store(root=root)
+            self.assertEqual(len(store.events(task_id=t["id"], kind="status", limit=None)), 2)
+            store.close()
+
     def test_backfill_survives_a_deleted_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
