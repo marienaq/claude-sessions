@@ -561,6 +561,21 @@ class TestVerbs(StoreCase):
         self.assertTrue(rows[0]["dispatch_ready"])
         self.assertEqual(rows[0]["open_dispatches"][0]["agent"], "iddy")
 
+    def test_owner_hands_a_task_over_and_back(self):
+        code, out = self.run_cli("task", "owner", "proj#1", "Anushka", "--actor", "orca")
+        self.assertEqual(code, 0, out)
+        self.assertIn("owner=anushka", out)
+        self.assertEqual(self.store.task(self.task["id"])["owner"], "anushka")
+        self.assertIsNone(self.store.next_task("proj"), "not MQ's next action any more")
+        ev = self.events(task_id=self.task["id"])[-1]
+        self.assertEqual((ev["kind"], ev["summary"]), ("update", "owner mq → anushka"))
+        text = (self.repo / "proj" / "task-list.md").read_text()
+        self.assertIn("| Anushka |", text)
+        code, out = self.run_cli("task", "owner", "proj#1", "Mariena")
+        self.assertEqual(self.store.task(self.task["id"])["owner"], "mq")
+        code, out = self.run_cli("task", "owner", "proj#1", "MQ")
+        self.assertIn("already owned by mq", out)
+
     def test_link_and_session_show(self):
         code, out = self.run_cli("task", "link", "proj#1", "--actor", "mq")
         self.assertEqual(code, 0, out)
@@ -582,7 +597,7 @@ class TestReferenceAndChecker(unittest.TestCase):
     def test_committed_reference_includes_the_new_verbs(self):
         text = (Path(__file__).resolve().parent.parent / "mh-reference.md").read_text()
         for verb in ("mh task dispatch", "mh task deliver", "mh task review",
-                     "mh task link", "mh task unlink", "mh question add", "mh question answer",
+                     "mh task link", "mh task unlink", "mh task owner", "mh question add", "mh question answer",
                      "mh question accept", "mh question list", "mh session show"):
             self.assertIn(verb, text)
 

@@ -385,6 +385,28 @@ def cmd_plan_propose(store, repo, args):
     return 0
 
 
+def cmd_task_owner(store, repo, args):
+    """
+    Hand a task to someone, or take it back.
+
+    Owner is who does the work, not who is waiting: a row owned by Anushka
+    stays off MQ's next-action list (next_task only returns mq rows) and
+    renders under her name in the task list. "MQ" and "Mariena" fold to mq.
+    """
+    task = resolve(store, args.task)
+    owner = mhstore.normalize_owner(args.owner)
+    if not owner:
+        raise CliError("owner needs a name")
+    if task["owner"] == owner:
+        print(f"already owned by {owner}: {show(task)}")
+        return 0
+    store.update_task(task["id"], actor=args.actor, owner=owner)
+    print(show(store.task(task["id"])))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
 def cmd_task_seq(store, repo, args):
     task = resolve(store, args.task)
     store.update_task(task["id"], actor=args.actor, seq=args.seq, is_next=0)
@@ -1019,6 +1041,17 @@ Moving the row off `waiting` later clears the reason automatically. For
 something that waits on **MQ**, ask a question instead (below): a task
 status cannot be answered, a question can.
 
+**Hand a task to someone else**
+
+```
+mh task owner aba-champions#37 anushka --actor orca
+mh task owner aba-champions#37 mq                    # take it back
+```
+
+Owner is who does the work. A row owned by someone else leaves MQ's
+next-action list and renders under their name; `waiting --waiting-on` is
+for a row MQ still owns that is blocked on them.
+
 **Ask MQ something, and propose the answer**
 
 ```
@@ -1176,6 +1209,11 @@ def build_parser():
     p.add_argument("task")
     p.add_argument("load", choices=(*mhstore.LOADS, "none"))
     p.set_defaults(fn=cmd_task_load)
+
+    p = task.add_parser("owner", help="hand a task to someone (mq, or a person's name)", parents=[common])
+    p.add_argument("task")
+    p.add_argument("owner", help="who does the work; MQ and Mariena fold to mq")
+    p.set_defaults(fn=cmd_task_owner)
 
     p = task.add_parser("seq", help="set ordering within a project", parents=[common])
     p.add_argument("task")

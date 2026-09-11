@@ -48,6 +48,7 @@ works as-is.
 | `mh task note <task> <text>` | — | append a dated entry to the note file |
 | `mh task plan <task> <day>` | — | put a task on a day, or take it off |
 | `mh task load <task> <load>` | — | set a task's load tag |
+| `mh task owner <task> <owner>` | — | hand a task to someone (mq, or a person's name) |
 | `mh task seq <task> <seq>` | — | set ordering within a project |
 | `mh task confirm <task>` | — | accept a capture proposal |
 | `mh task brief <task> <path>` | — | record a brief file path (must exist, under the repo) |
@@ -155,6 +156,17 @@ mh task status aba-champions#23 waiting --waiting-on "Sharla's review"
 Moving the row off `waiting` later clears the reason automatically. For
 something that waits on **MQ**, ask a question instead (below): a task
 status cannot be answered, a question can.
+
+**Hand a task to someone else**
+
+```
+mh task owner aba-champions#37 anushka --actor orca
+mh task owner aba-champions#37 mq                    # take it back
+```
+
+Owner is who does the work. A row owned by someone else leaves MQ's
+next-action list and renders under their name; `waiting --waiting-on` is
+for a row MQ still owns that is blocked on them.
 
 **Ask MQ something, and propose the answer**
 

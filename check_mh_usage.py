@@ -38,6 +38,7 @@ PLACEHOLDERS = {
     "day": "2026-08-31", "seq": "10", "n": "10", "title": "A title",
     "text": "Some text", "note": "Some text", "path": "some/path.md",
     "words": "some words", "load": "deep", "owner": "mq", "due": "2026-09-30",
+    "person": "anushka",
     # the task-view verbs
     "agent": "iddy", "name": "iddy", "your_name": "iddy", "verdict": "pass",
     "v": "pass", "answer": "Some answer", "question": "Some question?",
