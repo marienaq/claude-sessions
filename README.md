@@ -160,17 +160,21 @@ Each session card shows:
 
 ## Task view
 
-The **Tasks** tab (and `#task/<id>` links from day-card lines, session
-cards, and the Projects panel) opens one page per store task, in the order
-of what MQ needs to decide: the top of the brief, the open questions with
-Accept / Answer, the conversations on the task (click to focus or resume),
-and what agents have out and have done. Everything on it is read from the
-store; the brief is the only file parsed, and only its header, `## Goal`
-and `## Deliverables`.
+An **In flight** strip sits between the week and the session cards: every
+open task with a brief, a question for MQ, an agent at work, or a live
+conversation, ordered by when it bites. Clicking a chip, a day-card task
+name, a Projects-panel next action, or a card's linked task opens a popup
+for that task (`#task/<id>`, so it can be bookmarked): the top of the
+brief, the open questions with Accept / Answer, the conversations on the
+task (click to focus or resume; "+ link a conversation" attaches one), and
+what agents have out and have done. The circle on a day-card line, or in
+the popup header, checks the task off.
 
-**Work on this with Orca** resumes the most recent conversation whose `mh`
-writes touched the task, or opens a fresh `claude --agent orca` on it.
-Design and plan: `operations/ai-workflows/task-view/` in the content repo.
+**Work on this with Orca** resumes the conversation linked to the task, or
+failing that the most recent interactive one whose `mh` writes touched it
+(scheduled sweeps and capture-only writes are skipped), or opens a fresh
+`claude --agent orca`. Design and plan: `operations/ai-workflows/task-view/`
+in the content repo.
 
 The store behind it (`mhstore.py`) records every `mh` write as an event
 stamped with the Claude conversation that made it (`mhsession.py` finds the

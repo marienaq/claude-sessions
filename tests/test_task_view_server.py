@@ -308,6 +308,30 @@ class TestOrcaLauncher(TaskViewCase):
         self.assertIsNone(launch["resume"])
         self.assertIn("Read these first", launch["prompt"])
 
+    def test_capture_only_and_scheduled_sessions_are_not_resumed(self):
+        """A sweep writes to many tasks; its transcript is about none of them."""
+        sid_c = "cccccccc-1111-2222-3333-444444444444"
+        store = self.server.get_store()
+        store._session = {**mhsession.EMPTY, "session_id": sid_c, "kind": "interactive"}
+        store._session_recorded = False
+        store.update_task(self.task["id"], actor="capture", notes="swept")
+        self._transcript(SID_A, age_days=2)
+        self._transcript(SID_B, age_days=1)      # scheduled
+        self._transcript(sid_c, age_days=0)      # newest, but capture only
+        status, d = self.post("/api/task/orca", {"taskId": self.task["id"]})
+        self.assertEqual(d["resumed"], SID_A)
+
+    def test_linked_conversation_wins_over_a_newer_write(self):
+        sid_l = "dddddddd-1111-2222-3333-444444444444"
+        store = self.server.get_store()
+        store.link_session(self.task["id"], actor="mq", session_id=sid_l)
+        store._session = {**mhsession.EMPTY, "session_id": SID_A, "kind": "interactive"}
+        store.update_task(self.task["id"], actor="orca", notes="later")
+        self._transcript(SID_A)
+        self._transcript(sid_l)
+        _, d = self.post("/api/task/orca", {"taskId": self.task["id"]})
+        self.assertEqual(d["resumed"], sid_l)
+
     def test_no_brief_means_scope_and_start(self):
         status, d = self.post("/api/task/orca", {"taskId": self.other["id"]})
         self.assertEqual(status, 200)
@@ -337,15 +361,22 @@ class TestFrontEnd(unittest.TestCase):
         body = self.js.split("async function fetchTask(", 1)[1].split("\nfunction ", 1)[0]
         self.assertIn("lastTaskJson", body)
 
-    def test_views_are_routed_by_hash(self):
-        for hash_ in ("#task/", "#tasks", "#board"):
-            self.assertIn(hash_, self.js)
+    def test_popup_is_routed_by_hash(self):
+        self.assertIn("#task/", self.js)
         self.assertIn("hashchange", self.js)
+        body = self.js.split("function closeTaskModal(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("hidden = true", body)
 
-    def test_board_links_into_the_task_page(self):
-        self.assertIn('href="#task/${item.id}"', self.js)
-        self.assertIn('href="#task/${p.next.id}"', self.js)
-        self.assertIn('href="#task/${ta.taskId}"', self.js)
+    def test_board_opens_the_popup(self):
+        """The name opens the task; the circle checks it off."""
+        self.assertIn('onclick="openTask(${item.id})"', self.js)
+        self.assertIn("togglePriorityItemFromEl(this.parentElement)", self.js)
+        self.assertIn("openTask(${p.next.id})", self.js)
+        self.assertIn("openTask(${ta.taskId})", self.js)
+        self.assertIn('onclick="openTask(${t.id})"', self.js, "strip chips")
+
+    def test_escape_does_not_close_over_an_open_answer_box(self):
+        self.assertIn("e.key === 'Escape' && openTaskId && !document.querySelector('#taskView .answer-input')", self.js)
 
     def test_scheduled_runs_show_on_the_task_page(self):
         """The board hides them; on a task page the sweep's work is the point."""

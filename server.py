@@ -942,10 +942,22 @@ def find_task_session(store, task_id, max_age_days=14):
     the agent still holds what it read and why it did what it did.
     """
     cutoff = time.time() - max_age_days * 86400
+    # A capture sweep writes to many tasks in one run; resuming that
+    # transcript would put MQ in a conversation about nothing in particular.
+    # Scheduled sessions and sessions whose only writes here were capture or
+    # migration are skipped; a conversation someone linked on purpose wins.
     for row in store.conn.execute(
-            """SELECT session_id, MAX(ts) AS last FROM events
-               WHERE task_id = ? AND session_id IS NOT NULL
-               GROUP BY session_id ORDER BY last DESC""", (task_id,)):
+            """SELECT e.session_id, MAX(e.ts) AS last,
+                      MAX(e.kind = 'link') AS linked,
+                      SUM(e.actor NOT IN ('capture', 'migration')) AS real_writes,
+                      s.kind AS skind
+               FROM events e LEFT JOIN sessions s ON s.session_id = e.session_id
+               WHERE e.task_id = ? AND e.session_id IS NOT NULL
+               GROUP BY e.session_id ORDER BY linked DESC, last DESC""", (task_id,)):
+        if row["skind"] == "scheduled":
+            continue
+        if not row["linked"] and not row["real_writes"]:
+            continue
         sid = row["session_id"]
         for jsonl in CLAUDE_PROJECTS_DIR.glob(f"*/{sid}.jsonl"):
             try:
@@ -2195,7 +2207,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": "No such task"}, 404)
                 return
             self.send_json(payload)
-        elif self.path == "/":
+        elif self.path.split("?", 1)[0] == "/":
             self.send_html(HTML_PAGE)
         else:
             self.send_response(404)
@@ -3053,42 +3065,50 @@ body {
     color: var(--text-dim);
 }
 
-/* Tabs: Board | Tasks */
-.tabs { display: flex; gap: 4px; margin-left: 18px; }
-.tab {
-    font-size: 12px;
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid transparent;
-    color: var(--text-dim);
-    text-decoration: none;
-    cursor: pointer;
+/* In-flight tasks: one strip between the week and the session cards */
+.tasks-strip { display: flex; gap: 8px; overflow-x: auto; padding: 0 24px 12px; align-items: stretch; }
+.tasks-strip:empty { display: none; }
+.task-chip {
+    flex: 0 0 auto; width: 230px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+    padding: 8px 10px; cursor: pointer; font-size: 12px; line-height: 1.35;
+    display: flex; flex-direction: column; gap: 4px;
 }
-.tab:hover { color: var(--accent); }
-.tab.active { border-color: var(--border); background: var(--surface); color: var(--text); font-weight: 600; }
-.tab-count { opacity: 0.55; font-weight: 400; margin-left: 4px; }
+.task-chip:hover { border-color: var(--accent); }
+.task-chip .tag { font-family: ui-monospace, Menlo, monospace; font-size: 10px; color: var(--accent); }
+.task-chip .title { color: var(--text); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.task-chip .chip-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 10px; color: var(--text-dim); margin-top: auto; }
+.task-chip .chip-meta .decide { color: var(--orange); font-weight: 600; }
+.task-chip .chip-meta .card-status { margin-top: 0; }
+.tasks-strip-label { flex: 0 0 auto; writing-mode: vertical-rl; transform: rotate(180deg); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); align-self: center; }
+
+/* The task popup */
+.task-modal-overlay {
+    position: fixed; inset: 0; z-index: 900;
+    background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+}
+.task-modal-overlay[hidden] { display: none; }
+.task-modal {
+    position: relative; width: min(960px, 100%); max-height: 88vh; overflow-y: auto;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+}
+.task-modal-close {
+    position: absolute; top: 10px; right: 14px; font-size: 22px; line-height: 1;
+    color: var(--text-faint); cursor: pointer; z-index: 1;
+}
+.task-modal-close:hover { color: var(--text); }
+.task-check { font-size: 18px; color: var(--text-faint); cursor: pointer; line-height: 1; }
+.task-check:hover, .task-check.done { color: var(--green); }
+.priority-text { cursor: pointer; }
+.priority-text:hover { color: var(--accent); }
+.priority-check { cursor: pointer; }
+.conv-pick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.conv-pick .panel-btn { font-size: 11px; padding: 3px 8px; }
 
 /* The Tasks list and the task page */
-.tasks-list { padding: 8px 24px 40px; max-width: 980px; }
-.tasks-row {
-    display: grid;
-    grid-template-columns: 150px 1fr 90px 70px 60px;
-    gap: 12px;
-    align-items: center;
-    padding: 7px 10px;
-    margin: 0 -10px;
-    border-radius: 6px;
-    font-size: 13px;
-    color: var(--text);
-    text-decoration: none;
-}
-.tasks-row:hover { background: var(--accent-dim); }
-.tasks-row .tag { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-dim); }
-.tasks-row .when { font-size: 11px; color: var(--text-dim); }
-.tasks-row .qcount { font-size: 11px; color: var(--orange); font-weight: 600; }
-.tasks-row .dots { display: flex; gap: 4px; }
-.tasks-head { font-size: 11px; color: var(--text-faint); padding: 4px 0; }
-.task-page { padding: 8px 24px 60px; max-width: 980px; }
+.task-page { padding: 18px 24px 28px; }
 .task-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 14px; margin-bottom: 4px; }
 .task-head h2 { font-size: 20px; font-weight: 600; }
 .task-head .tag { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--accent); }
@@ -3138,7 +3158,7 @@ body {
 .conv-row .last { font-size: 11px; color: var(--text-dim); grid-column: 2 / span 3; margin-top: -2px; }
 .conv-row.dead { opacity: 0.75; }
 .agents-cols { display: grid; grid-template-columns: 1fr 1.4fr; gap: 24px; }
-@media (max-width: 720px) { .agents-cols { grid-template-columns: 1fr; } .tasks-row { grid-template-columns: 1fr; gap: 2px; } }
+@media (max-width: 720px) { .agents-cols { grid-template-columns: 1fr; } }
 .event-row { display: grid; grid-template-columns: 82px 1fr; gap: 10px; font-size: 12px; padding: 3px 0; line-height: 1.4; }
 .event-row .when { color: var(--text-faint); font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
 .event-row .actor { color: var(--text-dim); }
@@ -3988,12 +4008,8 @@ body {
 <body>
 
 <div class="header">
-    <div style="display:flex;align-items:center">
+    <div>
         <h1><span>Claude</span> Sessions</h1>
-        <div class="tabs">
-            <a class="tab active" id="tabBoard" href="#board">Board</a>
-            <a class="tab" id="tabTasks" href="#tasks">Tasks<span class="tab-count" id="tabTasksCount"></span></a>
-        </div>
     </div>
     <div class="legend">
         <span class="legend-item"><span class="legend-dot working"></span>Waiting on AI</span>
@@ -4009,6 +4025,7 @@ body {
 <div id="boardView">
 <div id="prioritiesBar" class="priorities-bar"></div>
 <div id="panelsBar" class="panels-bar"></div>
+<div id="tasksStrip" class="tasks-strip"></div>
 
 <div class="filter-bar">
     <span id="activeFilter"></span>
@@ -4019,8 +4036,12 @@ body {
 
 <div id="cardGridView" class="card-grid"></div>
 </div>
-<div id="tasksView" class="tasks-list" hidden></div>
-<div id="taskView" class="task-page" hidden></div>
+<div id="taskModal" class="task-modal-overlay" hidden onclick="closeTaskModal(event)">
+    <div class="task-modal" onclick="event.stopPropagation()">
+        <span class="task-modal-close" onclick="closeTaskModal()" title="Close (Esc)">×</span>
+        <div id="taskView" class="task-page"></div>
+    </div>
+</div>
 <div id="tagInputOverlay" class="tag-input-overlay" style="display:none"
      onclick="closeTagInput(event)"></div>
 
@@ -4063,42 +4084,53 @@ const PALETTE = ['purple','green','blue','red','orange','pink','teal','yellow'];
 let lastPrioritiesJson = null;
 let lastPanelsJson = null;
 
-// --- views: the board, the Tasks list, one task ---------------------------
+// --- the task popup ---------------------------------------------------------
 //
-// One page, three views, chosen by the hash so a task has a URL that can be
-// bookmarked or pasted: #board, #tasks, #task/<id>. The board keeps polling
-// underneath whichever view is showing, since its session list is what the
-// task page joins against.
+// One board, and a popup for one task, opened by #task/<id> so a task has a
+// URL that can be bookmarked or pasted. The board keeps polling underneath,
+// since its session list is what the task page joins against.
 
-let view = {name: 'board', taskId: null};
+let openTaskId = null;
 let lastTaskJson = null;
 let lastTasksJson = null;
 let taskData = null;
 
 function routeFromHash() {
-    const h = location.hash || '#board';
-    if (h.startsWith('#task/')) view = {name: 'task', taskId: Number(h.slice(6)) || null};
-    else if (h === '#tasks') view = {name: 'tasks', taskId: null};
-    else view = {name: 'board', taskId: null};
+    const h = location.hash || '';
+    const id = h.startsWith('#task/') ? Number(h.slice(6)) || null : null;
+    if (id === openTaskId) return;
+    openTaskId = id;
     lastTaskJson = null;
-    lastTasksJson = null;
-    applyView();
+    taskData = null;
+    const overlay = document.getElementById('taskModal');
+    overlay.hidden = !openTaskId;
+    if (openTaskId) {
+        document.getElementById('taskView').innerHTML = '<div class="task-empty">Loading…</div>';
+        fetchTask(true);
+    }
 }
 window.addEventListener('hashchange', routeFromHash);
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && openTaskId && !document.querySelector('#taskView .answer-input')) closeTaskModal();
+});
 
-function applyView() {
-    document.getElementById('boardView').hidden = view.name !== 'board';
-    document.getElementById('tasksView').hidden = view.name !== 'tasks';
-    document.getElementById('taskView').hidden = view.name !== 'task';
-    document.getElementById('tabBoard').classList.toggle('active', view.name === 'board');
-    document.getElementById('tabTasks').classList.toggle('active', view.name !== 'board');
-    if (view.name === 'tasks') fetchTasks(true);
-    if (view.name === 'task') fetchTask(true);
+function openTask(id) {
+    if (!id) return;
+    location.hash = '#task/' + id;
+}
+
+function closeTaskModal(ev) {
+    if (ev && ev.target !== ev.currentTarget) return;
+    if (location.hash.startsWith('#task/')) history.replaceState(null, '', location.pathname);
+    openTaskId = null;
+    taskData = null;
+    document.getElementById('taskModal').hidden = true;
+    fetchSessions(true);
 }
 
 async function pollView() {
-    if (view.name === 'tasks') fetchTasks();
-    else if (view.name === 'task') fetchTask();
+    fetchTasks();
+    if (openTaskId) fetchTask();
 }
 
 async function fetchSessions(force = false) {
@@ -4258,15 +4290,16 @@ function renderPriorities() {
     const noCurrent = priorities.noCurrentWeek;
     const live = priorities.source === 'store';
 
+    // The circle checks the row off; the name opens the task. Without a
+    // store id (markdown fallback) the whole row still toggles.
     const renderItem = (item) => `<div class="priority-item ${item.done ? 'done' : ''}"
         data-text="${escAttr(item.text)}"${item.id != null ? ` data-id="${item.id}"` : ''}
         data-done="${item.done ? '1' : '0'}"
         ${live && item.id != null ? 'draggable="true" ondragstart="dragTaskStart(event)"' : ''}
-        onclick="togglePriorityItemFromEl(this)" title="${escAttr(item.key || item.text)}">
-        <span class="priority-check">${item.done ? '✓' : '○'}</span>
+        ${live && item.id != null ? `onclick="openTask(${item.id})"` : 'onclick="togglePriorityItemFromEl(this)"'} title="${escAttr(item.key || item.text)}">
+        <span class="priority-check" ${live && item.id != null ? 'onclick="event.stopPropagation();togglePriorityItemFromEl(this.parentElement)"' : ''}>${item.done ? '✓' : '○'}</span>
         <span class="priority-text">${escHtml(item.text)}</span>
         ${item.load ? `<span class="priority-load">${escHtml(item.load)}</span>` : ''}
-        ${live && item.id != null ? `<a class="priority-open" href="#task/${item.id}" onclick="event.stopPropagation()" title="Open the task page">↗</a>` : ''}
     </div>`;
 
     const renderWeek = (w, showMapBtn, idx) => {
@@ -4423,9 +4456,8 @@ function renderPanels() {
     const itemRow = (item, actions) => `<div class="panel-item" draggable="true"
         data-id="${item.id}" ondragstart="dragTaskStart(event)"
         title="${escAttr(item.key || item.text)}">
-        <span class="panel-item-text">${escHtml(item.text)}</span>
+        <span class="panel-item-text" ${item.id != null ? `onclick="openTask(${item.id})" style="cursor:pointer"` : ''}>${escHtml(item.text)}</span>
         ${item.key ? `<span class="panel-item-key">${escHtml(item.key)}</span>` : ''}
-        ${item.id != null ? `<a class="panel-open" href="#task/${item.id}" onclick="event.stopPropagation()" title="Open the task page">↗</a>` : ''}
         ${actions}
     </div>`;
 
@@ -4445,7 +4477,7 @@ function renderPanels() {
     const projects = panels.projects.map(p => `<div class="panel-item">
         <span class="panel-item-text">
             <strong>${escHtml(p.name)}</strong>
-            ${p.next ? `<br><span class="panel-next" draggable="true" data-id="${p.next.id}" ondragstart="dragTaskStart(event)">${escHtml(p.next.text)}</span><a class="panel-open" href="#task/${p.next.id}" onclick="event.stopPropagation()" title="Open the task page">↗</a>`
+            ${p.next ? `<br><span class="panel-next" draggable="true" data-id="${p.next.id}" ondragstart="dragTaskStart(event)" onclick="openTask(${p.next.id})" style="cursor:pointer">${escHtml(p.next.text)}</span>`
                      : '<br><span class="panel-empty">no next action</span>'}
         </span>
         <span class="panel-item-key">${p.openCount} open${p.status !== 'active' ? ' · ' + escHtml(p.status) : ''}</span>
@@ -4641,7 +4673,7 @@ function renderCard(s) {
                 : '';
             linkHtml = `<div class="task-link-info">
                  <span class="task-link-change" onclick="event.stopPropagation();openTaskLink('${s.itermId}')" title="Change">&#x21D7;</span>
-                 <span class="task-link-name">${escHtml(s.taskList?.projectName || '')} → ${ta.taskId ? `<a href="#task/${ta.taskId}" onclick="event.stopPropagation()" title="Open the task page">${escHtml(ta.taskTitle)}</a>` : escHtml(ta.taskTitle)} ${taskLink}</span>
+                 <span class="task-link-name">${escHtml(s.taskList?.projectName || '')} → ${ta.taskId ? `<a href="#task/${ta.taskId}" onclick="event.stopPropagation();openTask(${ta.taskId})" title="Open the task">${escHtml(ta.taskTitle)}</a>` : escHtml(ta.taskTitle)} ${taskLink}</span>
                  <span class="task-link-remove" onclick="event.stopPropagation();unlinkTask('${s.itermId}')" title="Remove">×</span>
                </div>`;
         } else if (s.taskList) {
@@ -5279,48 +5311,49 @@ function escAttr(str) {
         .replace(/>/g, '&gt;');
 }
 
-// --- Tasks list ------------------------------------------------------------
+// --- In-flight strip ---------------------------------------------------------
 
 async function fetchTasks(force = false) {
     try {
         const res = await fetch('/api/tasks');
         const data = await res.json();
         const json = JSON.stringify(data);
-        const count = document.getElementById('tabTasksCount');
-        if (count) count.textContent = data.tasks?.length ? ' ' + data.tasks.length : '';
         if (!force && json === lastTasksJson) return;
         lastTasksJson = json;
-        if (view.name === 'tasks') renderTasks(data);
+        renderTasksStrip(data);
     } catch (e) {
         console.error('tasks fetch failed', e);
     }
 }
 
-function renderTasks(data) {
-    const el = document.getElementById('tasksView');
-    if (!data.available) { el.innerHTML = '<div class="task-empty">No store.</div>'; return; }
-    const rows = data.tasks || [];
-    if (!rows.length) {
-        el.innerHTML = '<div class="task-empty">Nothing in flight: no open task has a brief, an open question, an open dispatch, or a live conversation.</div>';
-        return;
-    }
+function renderTasksStrip(data) {
+    const el = document.getElementById('tasksStrip');
+    if (isDragging) return;
+    const rows = (data && data.available) ? (data.tasks || []) : [];
+    if (!rows.length) { el.innerHTML = ''; return; }
     const when = (t) => t.plannedDay ? shortDate(t.plannedDay) : (t.due ? 'due ' + shortDate(t.due) : '');
-    el.innerHTML = `<div class="tasks-head">${rows.length} in flight, ordered by when they bite. Everything else is reachable from a project on the board.</div>` +
-        rows.map(t => `<a class="tasks-row" href="#task/${t.id}">
+    el.innerHTML = `<span class="tasks-strip-label" title="Open tasks with a brief, a question for you, an agent at work, or a live conversation">In flight</span>` +
+        rows.map(t => `<div class="task-chip" onclick="openTask(${t.id})" title="${escAttr(t.title)}">
             <span class="tag">${escHtml(t.tag)}</span>
-            <span>${escHtml(t.title)}</span>
-            <span class="when">${escHtml(when(t))}</span>
-            <span class="qcount">${t.openQuestions ? t.openQuestions + ' to decide' : ''}</span>
-            <span class="dots">${'<span class="card-status working" title="live conversation"></span>'.repeat(Math.min(t.liveConversations || 0, 4))}${t.openDispatches ? '<span class="card-status ready" title="an agent has work out"></span>' : ''}</span>
-        </a>`).join('');
+            <span class="title">${escHtml(t.title)}</span>
+            <span class="chip-meta">
+                ${when(t) ? `<span>${escHtml(when(t))}</span>` : ''}
+                ${t.openQuestions ? `<span class="decide">${t.openQuestions} to decide</span>` : ''}
+                ${t.liveConversations ? `<span><span class="card-status working"></span> ${t.liveConversations} live</span>` : ''}
+                ${t.openDispatches ? `<span><span class="card-status ready"></span> agent at work</span>` : ''}
+                ${!t.hasBrief ? '<span>no brief</span>' : ''}
+            </span>
+        </div>`).join('');
 }
 
 // --- One task ---------------------------------------------------------------
 
 async function fetchTask(force = false) {
-    if (!view.taskId) return;
+    const id = openTaskId;
+    if (!id) return;
     try {
-        const res = await fetch('/api/task/' + view.taskId);
+        const res = await fetch('/api/task/' + id);
+        if (id !== openTaskId) return;        // closed or switched meanwhile
         if (!res.ok) {
             document.getElementById('taskView').innerHTML = '<div class="task-empty">No such task.</div>';
             return;
@@ -5334,6 +5367,14 @@ async function fetchTask(force = false) {
     } catch (e) {
         console.error('task fetch failed', e);
     }
+}
+
+function briefText(text) {
+    // Escaped first, then the two bits of markdown a brief header or list
+    // actually uses. Anything richer stays in Obsidian.
+    return escHtml(text)
+        .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>');
 }
 
 function shortDate(iso) {
@@ -5354,6 +5395,7 @@ function renderTask() {
     // The poll must never destroy an open answer box. Ask the DOM, as the
     // quick-add box does; flags have proved too easy to clear elsewhere.
     if (el.querySelector('.answer-input')) return;
+    if (el.querySelector('#convPick.open')) return;
     const d = taskData;
     const t = d.task;
     const brief = d.brief || {};
@@ -5375,8 +5417,9 @@ function renderTask() {
         hasBrief ? `<a class="map-btn" href="${escAttr(brief.obsidianUrl)}">Open brief</a>` : '',
         t.noteUrl ? `<a class="map-btn" href="${escAttr(t.noteUrl)}">Open note</a>` : '',
         `<button class="map-btn primary" onclick="orcaOnTask(${t.id})">${orcaLabel}</button>`,
-        t.status !== 'done' ? `<button class="map-btn" onclick="taskDone(${t.id})">Done</button>` : '',
     ].join('');
+    const isDone = t.status === 'done';
+    const check = `<span class="task-check${isDone ? ' done' : ''}" onclick="toggleTaskDone(${t.id}, ${isDone})" title="${isDone ? 'Reopen' : 'Mark done'}">${isDone ? '✓' : '○'}</span>`;
 
     // Brief
     let briefHtml;
@@ -5390,8 +5433,8 @@ function renderTask() {
             .filter(([k]) => !skip.has(k))
             .map(([k, v]) => `<span><b>${escHtml(k)}</b> ${escHtml(v)}</span>`).join('');
         briefHtml = `<div class="brief-header">${header}</div>` +
-            (brief.goal ? `<div class="brief-section"><h4>Goal</h4>${escHtml(brief.goal)}</div>` : '') +
-            (brief.deliverables ? `<div class="brief-section"><h4>Deliverables</h4>${escHtml(brief.deliverables)}</div>` : '') +
+            (brief.goal ? `<div class="brief-section"><h4>Goal</h4>${briefText(brief.goal)}</div>` : '') +
+            (brief.deliverables ? `<div class="brief-section"><h4>Deliverables</h4>${briefText(brief.deliverables)}</div>` : '') +
             (!brief.goal && !brief.deliverables ? '<div class="task-empty">The brief has no Goal or Deliverables section.</div>' : '');
     }
 
@@ -5435,6 +5478,7 @@ function renderTask() {
             ${c.lastEvent ? `<span class="last">${shortStamp(c.lastEvent.ts)} · ${escHtml(c.lastEvent.summary || c.lastEvent.kind)}</span>` : ''}
         </div>`;
     }).join('') || '<div class="task-empty">No conversation has touched this task. "Work on this with Orca" opens one.</div>';
+    const convPick = `<div class="conv-pick" id="convPick"><button class="panel-btn" onclick="showConversationPicker(${t.id})">+ link a conversation</button></div>`;
 
     // Agents
     const nextHtml = (d.next?.dispatches || []).map(e => `<div class="next-row">
@@ -5451,14 +5495,15 @@ function renderTask() {
 
     el.innerHTML = `
         <div class="task-head">
+            ${check}
             <span class="tag">${escHtml(t.tag)}</span>
-            <h2>${escHtml(t.title)}</h2>
+            <h2${isDone ? ' style="text-decoration:line-through;opacity:0.6"' : ''}>${escHtml(t.title)}</h2>
         </div>
         <div class="task-meta">${meta.filter(Boolean).join('<span>·</span>')}</div>
         <div class="task-actions">${actions}</div>
         <div class="task-block"><h3>Brief${hasBrief ? ` <span class="hint">${escHtml(t.briefPath.split('/').pop())}</span>` : ''}</h3>${briefHtml}</div>
         <div class="task-block"><h3>Needs you</h3>${needsHtml}</div>
-        <div class="task-block"><h3>Conversations</h3>${convHtml}</div>
+        <div class="task-block"><h3>Conversations</h3>${convHtml}${convPick}</div>
         <div class="task-block"><h3>Agents</h3>
             <div class="agents-cols">
                 <div><h3>Next</h3>${nextHtml}</div>
@@ -5506,10 +5551,43 @@ async function acceptQuestion(qid) {
     fetchTasks();
 }
 
-async function taskDone(id) {
-    await storeAction('task/done', {id});
+async function toggleTaskDone(id, wasDone) {
+    await storeAction('task/' + (wasDone ? 'reopen' : 'done'), {id});
     fetchTask(true);
     fetchSessions(true);
+}
+
+// Which board sessions look like they are about this task, by word overlap
+// with its title: the same rule `mh task find` uses. MQ picks; nothing is
+// linked on a guess.
+function showConversationPicker(taskId) {
+    const t = taskData?.task;
+    if (!t) return;
+    const linked = new Set((taskData.conversations || []).map(c => c.sessionId));
+    const words = (s) => new Set((s || '').toLowerCase().match(/[a-z0-9']+/g)?.filter(w => w.length > 2) || []);
+    const title = words(t.title + ' ' + (taskData.project?.name || ''));
+    const scored = sessions
+        .filter(s => !s.isAutomation && !linked.has(s.claudeSessionId || s.itermId))
+        .map(s => {
+            const w = words(s.name);
+            let hits = 0; w.forEach(x => { if (title.has(x)) hits++; });
+            return {s, hits};
+        })
+        .sort((a, b) => b.hits - a.hits || (b.s.isInactive ? 0 : 1) - (a.s.isInactive ? 0 : 1)
+                        || a.s.name.localeCompare(b.s.name));
+    const el = document.getElementById('convPick');
+    if (!el) return;
+    el.classList.add('open');          // renderTask leaves the picker alone while it is open
+    el.innerHTML = `<div style="width:100%;font-size:11px;color:var(--text-dim);margin-bottom:2px">Pick the conversation that is about this task:</div>` +
+        scored.slice(0, 12).map(({s, hits}) => `<button class="panel-btn" onclick="linkConversation(${taskId}, '${escAttr(s.itermId)}')"
+            title="${escAttr(s.shortCwd || '')}">${s.isInactive ? '' : '<span class="card-status ' + escAttr(s.cardState || 'ready') + '" style="display:inline-block;margin-right:4px"></span>'}${escHtml(s.name.slice(0, 48))}${hits ? ' <span style="opacity:0.5">' + hits + '</span>' : ''}</button>`).join('') +
+        `<button class="panel-btn" onclick="this.parentElement.classList.remove('open');renderTask()">cancel</button>`;
+}
+
+async function linkConversation(taskId, itermId) {
+    const ok = await storeAction('task/link', {itermId, taskId});
+    if (!ok) alert('Could not link that conversation.');
+    fetchTask(true);
 }
 
 async function orcaOnTask(id) {
@@ -5548,8 +5626,7 @@ async function openConversation(sessionId) {
 }
 
 // Initial load + auto-refresh
-routeFromHash();
-fetchSessions();
+fetchSessions().then(routeFromHash);
 fetchTasks();
 setInterval(fetchSessions, 5000);
 setInterval(pollView, 5000);
