@@ -38,6 +38,14 @@ PLACEHOLDERS = {
     "day": "2026-08-31", "seq": "10", "n": "10", "title": "A title",
     "text": "Some text", "note": "Some text", "path": "some/path.md",
     "words": "some words", "load": "deep", "owner": "mq", "due": "2026-09-30",
+    # the task-view verbs
+    "agent": "iddy", "name": "iddy", "your_name": "iddy", "verdict": "pass",
+    "v": "pass", "answer": "Some answer", "question": "Some question?",
+    "who": "Anushka", "who_waits": "Anushka", "where": "slack",
+    "source": "slack", "orca's_default": "Some answer",
+    "what_you_would_do": "Some answer", "brief_path": "some/brief.md",
+    "handback": "MQ", "reason": "Some reason", "expect": "some/path.md",
+    "artifact": "some/path.md", "findings": "some/findings.md",
 }
 
 
@@ -45,7 +53,13 @@ def substitute(command):
     """Replace <placeholders> with something the parser will accept."""
     def swap(match):
         name = match.group(1).strip().lower().replace("-", "_")
-        return PLACEHOLDERS.get(name, "placeholder")
+        if name in PLACEHOLDERS:
+            return PLACEHOLDERS[name]
+        # `<pass|pass-with-notes|back>` spells out a choice list; the first
+        # alternative is as good as any for checking the shape.
+        if "|" in name:
+            return match.group(1).split("|")[0].strip()
+        return "placeholder"
     return re.sub(r"<([^>]+)>", swap, command)
 
 

@@ -16,6 +16,9 @@ through this.
    touches them. Use `mh task note` to append, or write them directly.
 3. **Every write regenerates the views it affects**, so the markdown you read
    next is never behind the store you just wrote to.
+4. **Every write records which conversation made it.** `mh` finds the
+   Claude session it runs inside on its own; nothing to pass. `--actor` is
+   still yours to give.
 
 ## Identifying a task
 
@@ -47,7 +50,27 @@ works as-is.
 | `mh task load <task> <load>` | — | set a task's load tag |
 | `mh task seq <task> <seq>` | — | set ordering within a project |
 | `mh task confirm <task>` | — | accept a capture proposal |
-| `mh task brief <task> <path>` | — | record a brief file path |
+| `mh task brief <task> <path>` | — | record a brief file path (must exist, under the repo) |
+| `mh task dispatch <task>` | `--expect` `--summary` `--to` | record that work went to an agent |
+| `mh task deliver <task>` | `--agent` `--artifact` `--summary` | record a deliverable; closes the open dispatch |
+| `mh task review <task>` | `--agent` `--findings` `--summary` `--verdict` | record a reviewer's verdict |
+| `mh task link <task>` | — | show this conversation on the task's page |
+
+### `mh question`
+
+| Command | Options | What it does |
+|---|---|---|
+| `mh question add <scope> <text>` | `--blocks` `--proposed` | ask MQ something; always propose an answer |
+| `mh question answer <id> <answer>` | `--source` | record MQ's answer |
+| `mh question accept <id>` | `--source` | answer = the proposed answer |
+| `mh question withdraw <id>` | `--reason` | the question no longer applies |
+| `mh question list <scope>` | `--all` `--open` | open questions, in the order the dashboard shows them |
+
+### `mh session`
+
+| Command | Options | What it does |
+|---|---|---|
+| `mh session show` | — | what the store thinks this conversation is |
 
 ### `mh plan`
 
@@ -128,7 +151,53 @@ the file if it does not exist. Never rewrites what is there.
 mh task status aba-champions#23 waiting --waiting-on "Sharla's review"
 ```
 
-Moving the row off `waiting` later clears the reason automatically.
+Moving the row off `waiting` later clears the reason automatically. For
+something that waits on **MQ**, ask a question instead (below): a task
+status cannot be answered, a question can.
+
+**Ask MQ something, and propose the answer**
+
+```
+mh question add aba-champions#37 "Hold the VILT at 75 minutes, or run the 90?"     --proposed "90" --blocks "Anushka" --actor orca
+```
+
+Prints `Q41`. Always give `--proposed`: a question without a default answer
+is a research task, not a question, and the cheapest reply MQ can give is
+Accept. `--blocks` names who is waiting; a question from a person creates
+an obligation, a question from an agent does not. A near-duplicate of an
+open question on the same task is refused and the existing id printed.
+
+MQ answers in the session manager, or by id from anywhere:
+
+```
+mh question accept 41                              # answer = proposed
+mh question answer 41 "run the 90" --source slack  # her own words
+mh question list aba-champions#37                  # what is still open
+mh question list --open --json                     # for the Friday job
+```
+
+**Record what an agent did**
+
+```
+mh task dispatch aba-champions#37 --to iddy --expect path/to/draft.md --actor orca
+mh task deliver  aba-champions#37 --artifact path/to/draft.md --actor iddy
+mh task review   aba-champions#37 --verdict back --findings path/to/findings.md --actor revi
+```
+
+Each is one event on the task page. `deliver` closes the newest open
+dispatch for the same agent; when Orca records on a subagent's behalf, pass
+`--agent <name>`. A task is **dispatch-ready** when it has a brief and no
+open question that blocks anyone; nothing sets that by hand.
+
+**Show this conversation on a task**
+
+```
+mh task link aba-champions#37
+```
+
+Every `mh` write already records which Claude conversation made it (see
+`mh session show`), so this is only needed for a conversation that has not
+written anything yet.
 
 ## Safety
 

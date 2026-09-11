@@ -23,7 +23,11 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+import mhsession
+
+# 2 added events, questions and sessions (the task view). Stored in
+# PRAGMA user_version so open_store() can tell a v1 file from a v2 one.
+SCHEMA_VERSION = 2
 
 # Task lifecycle. The markdown these came from used 48 distinct strings for
 # these seven states; see normalize_status.
@@ -43,6 +47,19 @@ _PROJECT_STATUS_ALIASES = {"closed": "done", "canceled": "cancelled",
 
 LOADS = ("deep", "medium", "shallow")
 SOURCES = ("manual", "capture", "planning", "agent", "migration")
+
+# What an event records. The task page renders one line per kind, so the
+# list is the vocabulary of "what the agents did". 'update' covers a field
+# change that is none of the named ones (load, seq, notes), and 'setting'
+# a settings write; both exist so every audit line has a kind.
+EVENT_KINDS = (
+    "add", "status", "note", "plan", "done", "reopen", "confirm",
+    "dispatch", "deliver", "review", "question", "answer",
+    "brief", "link", "project", "week", "update", "setting",
+)
+VERDICTS = ("pass", "pass-with-notes", "back")
+QUESTION_STATUSES = ("open", "answered", "withdrawn")
+SESSION_KINDS = ("interactive", "scheduled", "unknown")
 
 # Phase 1 writes the literal string "none" for an absent date or id, and the
 # pre-Phase-1 files used several other sentinels. All of them mean NULL.
@@ -161,6 +178,60 @@ CREATE TABLE IF NOT EXISTS weeks (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Who did what. One row per audit line; the JSONL file stays the readable
+-- copy and the rollback path, this is what gets queried. session_id is the
+-- Claude conversation that made the write, found by mhsession without
+-- anyone passing it.
+CREATE TABLE IF NOT EXISTS events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    actor         TEXT NOT NULL,
+    session_id    TEXT,
+    iterm_id      TEXT,
+    task_id       INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    project_key   TEXT,
+    kind          TEXT NOT NULL CHECK (kind IN {EVENT_KINDS!r}),
+    summary       TEXT,
+    artifact_path TEXT,
+    agent         TEXT,
+    verdict       TEXT CHECK (verdict IS NULL OR verdict IN {VERDICTS!r}),
+    payload       TEXT NOT NULL DEFAULT '{{}}'
+);
+CREATE INDEX IF NOT EXISTS idx_events_task    ON events(task_id, ts);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
+
+-- What a `Question:` task row wanted to be: an id, a status, a proposed
+-- answer so the cheapest reply is Accept, and who is waiting on it.
+CREATE TABLE IF NOT EXISTS questions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    project_key  TEXT NOT NULL REFERENCES projects(key) ON UPDATE CASCADE,
+    text         TEXT NOT NULL,
+    proposed     TEXT,
+    blocks       TEXT,
+    asked_by     TEXT NOT NULL,
+    asked_at     TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'open'
+                 CHECK (status IN {QUESTION_STATUSES!r}),
+    answer       TEXT,
+    answered_by  TEXT,
+    answered_at  TEXT,
+    source       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_questions_open ON questions(status, project_key);
+
+-- Every Claude conversation the store has seen write to it.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id  TEXT PRIMARY KEY,
+    iterm_id    TEXT,
+    cwd         TEXT,
+    kind        TEXT,
+    actor       TEXT,
+    name        TEXT,
+    started_at  TEXT,
+    last_seen   TEXT NOT NULL
 );
 """
 
@@ -353,6 +424,96 @@ def _now():
 
 
 # ---------------------------------------------------------------------------
+# Events: what an audit line means
+#
+# The audit log records actions (task.update) with a before/after diff. The
+# task page wants to say what happened in one word, so the diff is read once
+# here, both for new writes and for the backfill of the 745 existing lines.
+# ---------------------------------------------------------------------------
+
+def event_kind(action, before, after):
+    """'task.update' + a diff -> one of EVENT_KINDS."""
+    after = after or {}
+    before = before or {}
+    if action == "task.add":
+        return "add"
+    if action.startswith("project."):
+        return "project"
+    if action.startswith("week."):
+        return "week"
+    if action.startswith("setting."):
+        return "setting"
+    if action != "task.update":
+        return "update"
+    if "status" in after:
+        if after["status"] == "done":
+            return "done"
+        if before.get("status") == "done":
+            return "reopen"
+        if "planned_day" in after and after["status"] in ("planned", "backlog"):
+            return "plan"
+        return "status"
+    if "note_path" in after:
+        return "note"
+    if "brief_path" in after:
+        return "brief"
+    if "confirmed" in after:
+        return "confirm"
+    if "planned_day" in after:
+        return "plan"
+    return "update"
+
+
+def event_summary(kind, action, before, after):
+    """The one line the task page shows for an audit-derived event."""
+    after = after or {}
+    before = before or {}
+    if kind == "add":
+        return f"added: {after.get('title', '')}".strip()
+    if kind == "done":
+        return "done"
+    if kind == "reopen":
+        return f"reopened as {after.get('status')}"
+    if kind == "status":
+        line = f"status {before.get('status')} → {after.get('status')}"
+        if after.get("waiting_on"):
+            line += f", waiting on {after['waiting_on']}"
+        return line
+    if kind == "plan":
+        day = after.get("planned_day")
+        return f"planned for {day}" if day else "taken off the week"
+    if kind == "note":
+        return "note appended"
+    if kind == "brief":
+        return f"brief: {after.get('brief_path') or 'cleared'}"
+    if kind == "confirm":
+        return "confirmed" if after.get("confirmed") else "unconfirmed"
+    if kind == "project":
+        return action.split(".")[-1] + " " + (after.get("key") or "")
+    if kind == "week":
+        return "week " + ", ".join(k for k in after) if isinstance(after, dict) else "week"
+    if kind == "setting":
+        return "setting " + ", ".join(f"{k}={v}" for k, v in after.items())
+    changed = ", ".join(f"{k}={after[k]}" for k in after) if isinstance(after, dict) else ""
+    return changed or action
+
+
+def word_overlap(a, b):
+    """
+    Share of the words in `a` (longer than two letters) that also occur in
+    `b`. The same rule `mh task find` scores by; used to refuse a question
+    that is already open in other words.
+    """
+    def words(text):
+        return {w for w in re.findall(r"[a-z0-9']+", (text or "").lower())
+                if len(w) > 2}
+    wa, wb = words(a), words(b)
+    if not wa:
+        return 0.0
+    return len(wa & wb) / len(wa)
+
+
+# ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
 
@@ -372,6 +533,10 @@ class Store:
         self._depth = 0
         self._dirty = False
         self._pending_audit = []
+        # Which conversation this process is. Found once, lazily, and
+        # stamped on every event; None everywhere when there is none.
+        self._session = None
+        self._session_recorded = False
 
     # -- infrastructure ----------------------------------------------------
 
@@ -414,12 +579,106 @@ class Store:
             self.conn.execute("COMMIT")
             self._flush()
 
-    def _audit(self, actor, action, task_id, before, after):
+    # -- session identity ---------------------------------------------------
+
+    @property
+    def session(self):
+        """The conversation this process runs in, detected once per process."""
+        if self._session is None:
+            try:
+                self._session = mhsession.current_session()
+            except Exception:                              # noqa: BLE001
+                self._session = dict(mhsession.EMPTY)
+        return self._session
+
+    def _record_session(self):
+        """Upsert the sessions row for this conversation, once per process."""
+        if self._session_recorded:
+            return
+        self._session_recorded = True
+        info = self.session
+        if not info.get("session_id"):
+            return
+        now = _now()
+        self.conn.execute(
+            """INSERT INTO sessions (session_id, iterm_id, cwd, kind, actor,
+                                     name, started_at, last_seen)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 iterm_id  = COALESCE(excluded.iterm_id, sessions.iterm_id),
+                 cwd       = COALESCE(excluded.cwd, sessions.cwd),
+                 kind      = COALESCE(excluded.kind, sessions.kind),
+                 actor     = COALESCE(excluded.actor, sessions.actor),
+                 name      = COALESCE(excluded.name, sessions.name),
+                 last_seen = excluded.last_seen""",
+            (info["session_id"], info.get("iterm_id"), info.get("cwd"),
+             info.get("kind") or "unknown", info.get("actor"),
+             info.get("name"), now, now))
+
+    def touch_session(self, session_id, actor=None, **fields):
+        """
+        Upsert a sessions row the dashboard learned about some other way (a
+        card it discovered, a resume it launched). Not audited: it records
+        that a conversation exists, not that anyone did anything.
+        """
+        now = _now()
+        self.conn.execute(
+            """INSERT INTO sessions (session_id, iterm_id, cwd, kind, actor,
+                                     name, started_at, last_seen)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 iterm_id  = COALESCE(excluded.iterm_id, sessions.iterm_id),
+                 cwd       = COALESCE(excluded.cwd, sessions.cwd),
+                 kind      = COALESCE(excluded.kind, sessions.kind),
+                 actor     = COALESCE(excluded.actor, sessions.actor),
+                 name      = COALESCE(excluded.name, sessions.name),
+                 last_seen = excluded.last_seen""",
+            (session_id, fields.get("iterm_id"), fields.get("cwd"),
+             fields.get("kind"), actor, fields.get("name"),
+             fields.get("started_at") or now, now))
+
+    # -- audit ------------------------------------------------------------
+
+    def _audit(self, actor, action, task_id, before, after, **event):
+        """
+        One audit line and one event row per write.
+
+        The line is the readable, greppable copy; the row is what the task
+        page and the sweeps query. Both carry the same actor, lower-cased:
+        the log had `orca` 62 times and `Orca` 28 before this.
+        """
+        actor = (actor or "system").strip().lower() or "system"
+        ts = _now()
         self._pending_audit.append(json.dumps({
-            "ts": _now(), "actor": actor, "action": action,
+            "ts": ts, "actor": actor, "action": action,
             "task_id": task_id, "before": before, "after": after,
         }, ensure_ascii=False))
         self._dirty = True
+
+        kind = event.pop("kind", None) or event_kind(action, before, after)
+        summary = event.pop("summary", None)
+        if summary is None:
+            summary = event_summary(kind, action, before, after)
+        project_key = event.pop("project_key", None)
+        if project_key is None and task_id is not None:
+            row = self.conn.execute(
+                "SELECT project_key FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            project_key = row["project_key"] if row else None
+        info = self.session
+        self._record_session()
+        payload = {"action": action, "before": before, "after": after}
+        payload.update(event.pop("payload", None) or {})
+        cur = self.conn.execute(
+            """INSERT INTO events (ts, actor, session_id, iterm_id, task_id,
+                                   project_key, kind, summary, artifact_path,
+                                   agent, verdict, payload)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, actor, info.get("session_id"), info.get("iterm_id"), task_id,
+             project_key, kind, summary, event.get("artifact_path"),
+             (event.get("agent") or None) and event["agent"].lower(),
+             event.get("verdict"),
+             json.dumps(payload, ensure_ascii=False)))
+        return cur.lastrowid
 
     def _flush(self):
         """Append buffered audit lines and refresh the snapshot."""
@@ -734,6 +993,337 @@ class Store:
                 self.update_task(row["id"], actor=actor, status="planned")
         return self.week(week_start)
 
+    # -- events ------------------------------------------------------------
+
+    def events(self, task_id=None, session_id=None, project_key=None,
+               kind=None, limit=50, newest_first=True):
+        sql, args = "SELECT * FROM events WHERE 1=1", []
+        if task_id is not None:
+            sql += " AND task_id = ?"
+            args.append(task_id)
+        if session_id:
+            sql += " AND session_id = ?"
+            args.append(session_id)
+        if project_key:
+            sql += " AND project_key = ?"
+            args.append(project_key)
+        if kind:
+            if isinstance(kind, str):
+                kind = (kind,)
+            sql += f" AND kind IN ({','.join('?' * len(kind))})"
+            args.extend(kind)
+        sql += " ORDER BY ts DESC, id DESC" if newest_first else " ORDER BY ts, id"
+        if limit:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def record_event(self, task_id, kind, actor="system", summary=None,
+                     **fields):
+        """
+        An event that is not a field change: dispatch, deliver, review,
+        link. Audited like everything else, so the JSONL log has it too.
+        """
+        if kind not in EVENT_KINDS:
+            raise StoreError(f"bad event kind {kind!r}")
+        task = self.task(task_id) if task_id is not None else None
+        if task_id is not None and not task:
+            raise StoreError(f"no task {task_id}")
+        after = {"kind": kind}
+        for key in ("agent", "artifact_path", "verdict", "summary"):
+            if fields.get(key):
+                after[key] = fields[key]
+        if summary:
+            after["summary"] = summary
+        event_id = self._audit(
+            actor, f"task.{kind}", task_id, None, after, kind=kind,
+            summary=summary, agent=fields.get("agent"),
+            artifact_path=fields.get("artifact_path"),
+            verdict=fields.get("verdict"), payload=fields.get("payload"),
+            project_key=fields.get("project_key"))
+        self._commit_if_top()
+        return self.event(event_id)
+
+    def event(self, event_id):
+        row = self.conn.execute(
+            "SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        return dict(row) if row else None
+
+    def dispatch(self, task_id, agent, expect=None, actor="system", summary=None):
+        agent = (agent or "").strip().lower()
+        if not agent:
+            raise StoreError("dispatch needs an agent")
+        return self.record_event(
+            task_id, "dispatch", actor=actor, agent=agent, artifact_path=expect,
+            summary=summary or (f"dispatched to {agent}"
+                                + (f", expecting {expect}" if expect else "")))
+
+    def open_dispatches(self, task_id):
+        """
+        Dispatches with no delivery after them from the same agent.
+
+        A delivery closes the newest open dispatch for its agent; a delivery
+        with no agent closes the newest open dispatch of any agent. Nothing
+        is edited to mark a dispatch closed: the record is the order of
+        events, so the answer is always recomputable.
+        """
+        rows = self.events(task_id=task_id, kind=("dispatch", "deliver"),
+                           limit=None, newest_first=False)
+        open_ = []
+        for row in rows:
+            if row["kind"] == "dispatch":
+                open_.append(row)
+                continue
+            agent = row["agent"]
+            for i in range(len(open_) - 1, -1, -1):
+                if agent is None or open_[i]["agent"] == agent:
+                    del open_[i]
+                    break
+        return open_
+
+    def deliver(self, task_id, artifact_path, actor="system", agent=None,
+                summary=None):
+        """
+        The agent is the actor unless told otherwise: a specialist running
+        as the session delivers its own work, and Orca recording for a
+        subagent passes agent=. Closes that agent's newest open dispatch;
+        with none to close, the delivery still stands on its own.
+        """
+        agent = (agent or actor or "").strip().lower() or None
+        closes = None
+        for d in reversed(self.open_dispatches(task_id)):
+            if d["agent"] == agent:
+                closes = d
+                break
+        return self.record_event(
+            task_id, "deliver", actor=actor, agent=agent,
+            artifact_path=artifact_path,
+            summary=summary or f"delivered {artifact_path}",
+            payload={"closes": closes["id"]} if closes else None)
+
+    def review(self, task_id, verdict, findings=None, actor="system",
+               agent=None, summary=None):
+        if verdict not in VERDICTS:
+            raise StoreError(f"verdict must be one of {', '.join(VERDICTS)}")
+        return self.record_event(
+            task_id, "review", actor=actor, agent=agent, verdict=verdict,
+            artifact_path=findings,
+            summary=summary or f"review: {verdict}")
+
+    def link_session(self, task_id, actor="system", session_id=None,
+                     iterm_id=None, summary=None):
+        """
+        Say that a conversation is about this task. The current session is
+        the default; the dashboard passes one explicitly for a card it is
+        linking on MQ's behalf.
+        """
+        info = self.session
+        sid = session_id or info.get("session_id")
+        payload = {"session_id": sid, "iterm_id": iterm_id or info.get("iterm_id")}
+        row = self.record_event(
+            task_id, "link", actor=actor,
+            summary=summary or ("linked this conversation" if sid
+                                else "linked (no session detected)"),
+            payload=payload)
+        if session_id and session_id != info.get("session_id"):
+            # The event was stamped with the writer's own session; the
+            # linked one is what the task page should join on.
+            self.conn.execute(
+                "UPDATE events SET session_id = ?, iterm_id = ? WHERE id = ?",
+                (session_id, iterm_id, row["id"]))
+            self.touch_session(session_id, iterm_id=iterm_id)
+            self._commit_if_top()
+            row = self.event(row["id"])
+        return row
+
+    def last_review(self, task_id):
+        rows = self.events(task_id=task_id, kind="review", limit=1)
+        return rows[0] if rows else None
+
+    # -- questions ---------------------------------------------------------
+
+    def question(self, question_id):
+        row = self.conn.execute(
+            "SELECT * FROM questions WHERE id = ?", (question_id,)).fetchone()
+        return dict(row) if row else None
+
+    def questions(self, task_id=None, project_key=None, status="open",
+                  include_task_level=True):
+        """
+        Open by default. Ordered the way the dashboard lists them: by the
+        task's planned day, then its due date, then when they were asked.
+        """
+        sql = """SELECT q.* FROM questions q
+                 LEFT JOIN tasks t ON t.id = q.task_id
+                 WHERE 1=1"""
+        args = []
+        if status:
+            sql += " AND q.status = ?"
+            args.append(status)
+        if task_id is not None:
+            sql += " AND q.task_id = ?"
+            args.append(task_id)
+        if project_key:
+            sql += " AND q.project_key = ?"
+            args.append(project_key)
+            if not include_task_level:
+                sql += " AND q.task_id IS NULL"
+        sql += """ ORDER BY t.planned_day IS NULL, t.planned_day,
+                            t.due IS NULL, t.due, q.asked_at, q.id"""
+        return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def find_duplicate_question(self, text, task_id=None, project_key=None,
+                                threshold=0.8):
+        """An open question on the same task (or project) in nearly the same words."""
+        scope = self.questions(task_id=task_id) if task_id is not None \
+            else self.questions(project_key=project_key, include_task_level=False)
+        for q in scope:
+            if word_overlap(text, q["text"]) >= threshold \
+                    or word_overlap(q["text"], text) >= threshold:
+                return q
+        return None
+
+    def add_question(self, text, actor="system", task_id=None,
+                     project_key=None, proposed=None, blocks=None):
+        text = (text or "").strip()
+        if not text:
+            raise StoreError("a question needs text")
+        task = None
+        if task_id is not None:
+            task = self.task(task_id)
+            if not task:
+                raise StoreError(f"no task {task_id}")
+            project_key = task["project_key"]
+        if not project_key or not self.project(project_key):
+            raise StoreError(f"no project {project_key!r}")
+        dup = self.find_duplicate_question(text, task_id=task_id,
+                                           project_key=project_key)
+        if dup:
+            raise StoreError(f"already open as Q{dup['id']}: {dup['text']}")
+        actor = (actor or "system").strip().lower()
+        now = _now()
+        cur = self.conn.execute(
+            """INSERT INTO questions (task_id, project_key, text, proposed,
+                                      blocks, asked_by, asked_at, status)
+               VALUES (?,?,?,?,?,?,?,'open')""",
+            (task_id, project_key, text, (proposed or "").strip() or None,
+             (blocks or "").strip() or None, actor, now))
+        qid = cur.lastrowid
+        line = f"Q{qid} asked: {text}"
+        if blocks:
+            line += f" (blocks {blocks})"
+        self._audit(actor, "question.add", task_id, None,
+                    {"question_id": qid, "text": text, "proposed": proposed,
+                     "blocks": blocks},
+                    kind="question", summary=line, project_key=project_key,
+                    payload={"question_id": qid})
+        self._commit_if_top()
+        return self.question(qid)
+
+    def answer_question(self, question_id, answer=None, actor="system",
+                        source=None, accept=False):
+        q = self.question(question_id)
+        if not q:
+            raise StoreError(f"no question Q{question_id}")
+        if q["status"] != "open":
+            raise StoreError(f"Q{question_id} is already {q['status']}")
+        if accept:
+            if not q["proposed"]:
+                raise StoreError(f"Q{question_id} has no proposed answer to accept")
+            answer = q["proposed"]
+        answer = (answer or "").strip()
+        if not answer:
+            raise StoreError("an answer needs text")
+        actor = (actor or "system").strip().lower()
+        now = _now()
+        self.conn.execute(
+            """UPDATE questions SET status = 'answered', answer = ?,
+                   answered_by = ?, answered_at = ?, source = ?
+               WHERE id = ?""",
+            (answer, actor, now, source, question_id))
+        self._audit(actor, "question.answer", q["task_id"],
+                    {"status": "open"},
+                    {"question_id": question_id, "answer": answer,
+                     "source": source, "accepted": bool(accept)},
+                    kind="answer", project_key=q["project_key"],
+                    summary=f"Q{question_id} {'accepted' if accept else 'answered'}: {answer}",
+                    payload={"question_id": question_id})
+        self._commit_if_top()
+        return self.question(question_id)
+
+    def withdraw_question(self, question_id, actor="system", reason=None):
+        q = self.question(question_id)
+        if not q:
+            raise StoreError(f"no question Q{question_id}")
+        if q["status"] != "open":
+            raise StoreError(f"Q{question_id} is already {q['status']}")
+        actor = (actor or "system").strip().lower()
+        self.conn.execute(
+            """UPDATE questions SET status = 'withdrawn', answered_by = ?,
+                   answered_at = ?, answer = ? WHERE id = ?""",
+            (actor, _now(), reason, question_id))
+        self._audit(actor, "question.withdraw", q["task_id"],
+                    {"status": "open"}, {"question_id": question_id,
+                                         "reason": reason},
+                    kind="question", project_key=q["project_key"],
+                    summary=f"Q{question_id} withdrawn"
+                            + (f": {reason}" if reason else ""),
+                    payload={"question_id": question_id})
+        self._commit_if_top()
+        return self.question(question_id)
+
+    def blocking_questions(self, task_id):
+        return [q for q in self.questions(task_id=task_id) if q["blocks"]]
+
+    def dispatch_ready(self, task_id):
+        """
+        Derived, never stored: a brief exists and no open question on the
+        task blocks anyone. The brief's own "Dispatch-ready" line used to
+        be flipped by hand and lied; see task note #242.
+        """
+        task = self.task(task_id)
+        if not task or not task["brief_path"]:
+            return False
+        return not self.blocking_questions(task_id)
+
+    # -- sessions ----------------------------------------------------------
+
+    def session_row(self, session_id):
+        row = self.conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    def sessions_for_task(self, task_id):
+        """
+        Every conversation that has written to this task, newest write
+        first, with the last thing it wrote. Includes conversations the
+        sessions table never saw (a link recorded by the dashboard for a
+        transcript it discovered), so the join is left.
+        """
+        rows = self.conn.execute(
+            """SELECT e.session_id, e.iterm_id, MAX(e.ts) AS last_ts,
+                      COUNT(*) AS n
+               FROM events e
+               WHERE e.task_id = ? AND e.session_id IS NOT NULL
+               GROUP BY e.session_id
+               ORDER BY last_ts DESC""", (task_id,)).fetchall()
+        result = []
+        for r in rows:
+            last = self.conn.execute(
+                """SELECT * FROM events WHERE task_id = ? AND session_id = ?
+                   ORDER BY ts DESC, id DESC LIMIT 1""",
+                (task_id, r["session_id"])).fetchone()
+            info = self.session_row(r["session_id"]) or {
+                "session_id": r["session_id"], "iterm_id": r["iterm_id"],
+                "cwd": None, "kind": None, "actor": None, "name": None,
+                "started_at": None, "last_seen": r["last_ts"]}
+            info = dict(info)
+            info["iterm_id"] = info.get("iterm_id") or r["iterm_id"]
+            info["event_count"] = r["n"]
+            info["last_event"] = dict(last) if last else None
+            result.append(info)
+        return result
+
     # -- settings ----------------------------------------------------------
 
     def set_setting(self, key, value, actor="system"):
@@ -758,6 +1348,10 @@ class Store:
                       self.conn.execute("SELECT * FROM weeks ORDER BY week_start")],
             "settings": {r["key"]: r["value"] for r in
                          self.conn.execute("SELECT * FROM settings")},
+            "questions": [dict(r) for r in
+                          self.conn.execute("SELECT * FROM questions ORDER BY id")],
+            "sessions": [dict(r) for r in
+                         self.conn.execute("SELECT * FROM sessions ORDER BY last_seen")],
         }
 
     def write_snapshot(self):
@@ -831,6 +1425,7 @@ def open_store(root=None, db_path=None, seed_settings=True):
         conn.execute("ALTER TABLE tasks ADD COLUMN notes TEXT")
 
     store = Store(conn, root)
+    migrate_schema(store)
     if seed_settings:
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute(
@@ -845,6 +1440,77 @@ def open_store(root=None, db_path=None, seed_settings=True):
                 (ONE_OFF, "One-off tasks", "active", "mq", "[]", now, now))
         conn.commit()
     return store
+
+
+def migrate_schema(store):
+    """
+    Bring a v1 file up to v2, once.
+
+    The tables themselves are CREATE IF NOT EXISTS, so the only work is to
+    backfill `events` from the audit lines that predate the table, with the
+    kind read off each line's diff. Nothing else is inferred: a dispatch that
+    only ever lived in a note file stays there until the backfill script
+    (or the next sweep) records it properly.
+    """
+    conn = store.conn
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version >= SCHEMA_VERSION:
+        return False
+    if version < 2:
+        have_events = conn.execute("SELECT 1 FROM events LIMIT 1").fetchone()
+        if not have_events and store.audit_log.exists():
+            backfill_events_from_audit(store)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    return True
+
+
+def backfill_events_from_audit(store):
+    """One event row per audit line. Returns how many were written."""
+    conn = store.conn
+    n = 0
+    conn.execute("BEGIN")
+    try:
+        with open(store.audit_log) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                action = rec.get("action") or "unknown"
+                before, after = rec.get("before"), rec.get("after")
+                kind = event_kind(action, before, after)
+                task_id = rec.get("task_id")
+                project_key = None
+                if task_id is not None:
+                    row = conn.execute("SELECT project_key FROM tasks WHERE id = ?",
+                                       (task_id,)).fetchone()
+                    project_key = row["project_key"] if row else (
+                        (after or {}).get("project") if isinstance(after, dict) else None)
+                    if row is None:
+                        task_id = None      # the row is gone; keep the line, drop the FK
+                elif action.startswith("project.") and isinstance(after, dict):
+                    project_key = after.get("key")
+                conn.execute(
+                    """INSERT INTO events (ts, actor, session_id, iterm_id, task_id,
+                                           project_key, kind, summary, artifact_path,
+                                           agent, verdict, payload)
+                       VALUES (?,?,NULL,NULL,?,?,?,?,NULL,NULL,NULL,?)""",
+                    (rec.get("ts") or _now(),
+                     (rec.get("actor") or "system").strip().lower() or "system",
+                     task_id, project_key, kind,
+                     event_summary(kind, action, before, after),
+                     json.dumps({"action": action, "before": before,
+                                 "after": after, "backfilled": True},
+                                ensure_ascii=False)))
+                n += 1
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return n
 
 
 if __name__ == "__main__":

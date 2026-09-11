@@ -109,13 +109,30 @@ def cell(value):
 # Project task lists
 # ---------------------------------------------------------------------------
 
-def render_task_row(task, repo_rel_note=True):
+def render_question_inline(q):
+    """`Q41 (blocks Anushka): Hold at 75 or run 90? Proposed: 90`"""
+    head = f"Q{q['id']}"
+    if q.get("blocks"):
+        head += f" (blocks {q['blocks']})"
+    line = f"{head}: {q['text']}"
+    if q.get("proposed"):
+        line += f" Proposed: {q['proposed']}"
+    return line
+
+
+def render_task_row(task, repo_rel_note=True, questions=()):
     note = ""
     if task["notes"]:
         note = task["notes"]
     if task["note_path"]:
         link = f"[note]({Path(task['note_path']).name})" if repo_rel_note else ""
         note = f"{note} {link}".strip() if note else link
+    # An open question sits with the row it gates, so a reader of the list
+    # sees what MQ still has to decide without opening the brief. Answered
+    # ones do not render: the answer is in the store and the note file.
+    for q in questions:
+        note = f"{note} — {render_question_inline(q)}".strip(" —") if note \
+            else render_question_inline(q)
     return "| " + " | ".join(cell(x) for x in (
         task["display_ord"] or task["id"],
         task["title"],
@@ -174,6 +191,10 @@ def generate_task_list(store, repo, project_key, dry_run=False):
     by_section = {}
     for task in tasks:
         by_section.setdefault(task["section"], []).append(task)
+    open_questions = {}
+    for q in store.questions(project_key=project_key):
+        if q["task_id"] is not None:
+            open_questions.setdefault(q["task_id"], []).append(q)
 
     def sort_key(t):
         terminal = t["status"] in ("done", "canceled")
@@ -194,7 +215,8 @@ def generate_task_list(store, repo, project_key, dry_run=False):
                     consumed.add(other)
         out.append(TASK_TABLE_HEADER)
         out.append(TASK_TABLE_DIVIDER)
-        out.extend(render_task_row(t) for t in sorted(rows, key=sort_key))
+        out.extend(render_task_row(t, questions=open_questions.get(t["id"], ()))
+                   for t in sorted(rows, key=sort_key))
         prev_end = end
     out.extend(lines[prev_end:])
 
@@ -227,6 +249,20 @@ def render_day_line(task):
         bits.append(f"`{task['project_key']}#{task['display_ord']}`")
     if task["status"] == "done" and task["done_at"]:
         bits.append(f"(done {task['done_at']})")
+    return " ".join(bits)
+
+
+def render_question_line(store, q):
+    """One priorities.md line for an open question that blocks someone."""
+    bits = [f"- [ ] **Q{q['id']}** {q['text']}"]
+    if q["proposed"]:
+        bits.append(f"Proposed: {q['proposed']}.")
+    bits.append(f"Blocks {q['blocks']}.")
+    task = store.task(q["task_id"]) if q["task_id"] else None
+    if task and task["project_key"] != ONE_OFF and task["display_ord"]:
+        bits.append(f"`{task['project_key']}#{task['display_ord']}`")
+    elif not task:
+        bits.append(f"`{q['project_key']}`")
     return " ".join(bits)
 
 
@@ -267,6 +303,11 @@ def render_week(store, week_start):
     lines.append("### Blocked or waiting")
     lines.append("")
     lines.extend(render_day_line(t) for t in blocked)
+    # A question that blocks a person is the same kind of fact as a row
+    # that waits on one, so it lists here, with the id MQ answers by.
+    for q in store.questions():
+        if q["blocks"]:
+            lines.append(render_question_line(store, q))
     lines.append("")
 
     proposed = [dict(r) for r in store.conn.execute(
@@ -377,6 +418,7 @@ def generate_dashboard(store, repo, dry_run=False):
             continue
         open_tasks = store.tasks(project_key=project["key"], open_only=True)
         nxt = store.next_task(project["key"])
+        questions = store.questions(project_key=project["key"])
         entry = {
             "key": project["key"],
             "name": project["name"],
@@ -387,6 +429,14 @@ def generate_dashboard(store, repo, dry_run=False):
             "openCount": len(open_tasks),
             "next": ({"id": nxt["id"], "title": nxt["title"], "seq": nxt["seq"],
                       "due": nxt["due"]} if nxt else None),
+            # The Friday job and the Slack post read one file; the open
+            # questions ride along so neither has to open the store.
+            "openQuestions": len(questions),
+            "questions": [{
+                "id": q["id"], "taskId": q["task_id"], "text": q["text"],
+                "proposed": q["proposed"], "blocks": q["blocks"],
+                "askedBy": q["asked_by"], "askedAt": q["asked_at"],
+            } for q in questions],
         }
         rows.append(entry)
         (archived if project["status"] in mhstore.ARCHIVED_PROJECT_STATUSES
@@ -402,12 +452,12 @@ def generate_dashboard(store, repo, dry_run=False):
         if not group:
             continue
         md += [f"## {label}", "",
-               "| Project | Next task | Due | Open |",
-               "|---|---|---|---|"]
+               "| Project | Next task | Due | Open | Questions |",
+               "|---|---|---|---|---|"]
         for r in sorted(group, key=lambda r: r["key"]):
             nxt = r["next"]["title"] if r["next"] else "—"
             md.append(f"| `{r['key']}` | {cell(nxt)} | {r['due'] or ''} "
-                      f"| {r['openCount']} |")
+                      f"| {r['openCount']} | {r['openQuestions'] or ''} |")
         md.append("")
 
     md_text = "\n".join(md).rstrip("\n") + "\n"

@@ -11,6 +11,9 @@ a hand edit is silently overwritten the next time anything regenerates.
     mh task add aba-academy "Draft the outline" --load deep --day 2026-09-03
     mh task status aba-champions#23 waiting --waiting-on "Sharla's review"
     mh task note aba-academy#25 "Sharla returned the copy 9/2"
+    mh task dispatch aba-champions#37 --to iddy --expect path/to/draft.md
+    mh question add aba-champions#37 "75 or 90 minutes?" --proposed 90 --blocks Anushka
+    mh question answer 41 "run the 90"
     mh plan lock 2026-08-31
     mh verify
 
@@ -29,6 +32,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import mhgen
+import mhsession
 import mhstore
 from mhstore import ONE_OFF, OPEN_STATUSES, StoreError
 
@@ -55,6 +59,16 @@ def _task_status(value):
             f"{value!r} is not a task status "
             f"({', '.join(mhstore.TASK_STATUSES)})")
     return status
+
+
+def _question_id(value):
+    """'41', 'Q41' and '`Q41`' all name question 41."""
+    text = str(value).strip().strip("`")
+    if text[:1].lower() == "q":
+        text = text[1:]
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError(f"{value!r} is not a question id (41 or Q41)")
+    return int(text)
 
 
 def resolve(store, ident):
@@ -103,6 +117,53 @@ def show(task, prefix=""):
     if extra:
         bits.append("    " + "  ".join(extra))
     return "\n".join(bits)
+
+
+def show_readiness(store, task):
+    """
+    One more line under a row: whether it can be handed to an agent.
+
+    Dispatch-ready is derived (a brief, and no open question that blocks
+    anyone), so this is the only place it is ever printed.
+    """
+    open_qs = store.questions(task_id=task["id"])
+    if not task["brief_path"] and not open_qs:
+        return ""
+    bits = []
+    bits.append(f"brief {task['brief_path']}" if task["brief_path"] else "no brief")
+    blocking = [q for q in open_qs if q["blocks"]]
+    if blocking:
+        bits.append("blocked by " + ", ".join(
+            f"Q{q['id']} ({q['blocks']})" for q in blocking))
+    elif open_qs:
+        bits.append("open: " + ", ".join(f"Q{q['id']}" for q in open_qs))
+    if store.dispatch_ready(task["id"]):
+        bits.append("dispatch-ready")
+    return "    " + "  ".join(bits)
+
+
+def show_question(q, task=None):
+    head = f"Q{q['id']:<5}"
+    where = ""
+    if task:
+        where = f" [{tag(task)}]"
+    elif q.get("project_key"):
+        where = f" [{q['project_key']}]"
+    line = f"{head}{where} {q['text']}"
+    tail = []
+    if q.get("proposed"):
+        tail.append(f"Proposed: {q['proposed']}")
+    if q.get("blocks"):
+        tail.append(f"blocks {q['blocks']}")
+    if q.get("status") == "answered":
+        tail.append(f"answered by {q['answered_by']} {q['answered_at'][:10]}: {q['answer']}")
+    elif q.get("status") == "withdrawn":
+        tail.append("withdrawn")
+    else:
+        tail.append(f"asked by {q['asked_by']} {q['asked_at'][:10]}")
+    if tail:
+        line += "\n        " + "  ".join(tail)
+    return line
 
 
 def regenerate(store, repo, touched_projects, quiet=False):
@@ -157,6 +218,9 @@ def cmd_task_next(store, repo, args):
         print(f"{args.project}: nothing open")
         return 0
     print(show(task))
+    ready = show_readiness(store, task)
+    if ready:
+        print(ready)
     return 0
 
 
@@ -340,9 +404,233 @@ def cmd_task_confirm(store, repo, args):
 
 
 def cmd_task_brief(store, repo, args):
+    """
+    Record where the brief is. Validated, because one row in 291 carried a
+    brief_path a month after the verb shipped and a path that does not
+    resolve would make the task page's "Open brief" a dead button.
+    """
     task = resolve(store, args.task)
-    store.update_task(task["id"], actor=args.actor, brief_path=args.path)
+    rel = _repo_relative(repo, args.path)
+    if not (repo / rel).is_file():
+        raise CliError(f"no such file under the repo: {rel}")
+    store.update_task(task["id"], actor=args.actor, brief_path=rel)
     print(show(store.task(task["id"])))
+    print(show_readiness(store, store.task(task["id"])))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
+def _repo_relative(repo, path):
+    """
+    A path as the store keeps it: relative to the repo, no leading ./.
+
+    Absolute paths inside the repo are accepted and trimmed; anything that
+    escapes the repo is refused, since artifact links open in Obsidian by
+    joining to the repo root.
+    """
+    raw = Path(str(path).strip().strip("`"))
+    if raw.is_absolute():
+        try:
+            return str(raw.resolve().relative_to(repo.resolve()))
+        except ValueError:
+            raise CliError(f"{raw} is outside the repo {repo}")
+    text = str(raw)
+    if text.startswith("./"):
+        text = text[2:]
+    if text.startswith("../") or "/../" in text:
+        raise CliError(f"{text} escapes the repo")
+    return text
+
+
+def _artifact(repo, path):
+    """An artifact path for an event: relative, but not required to exist yet."""
+    return _repo_relative(repo, path) if path else None
+
+
+# ---------------------------------------------------------------------------
+# task: the agent record (dispatch, deliver, review, link)
+# ---------------------------------------------------------------------------
+
+def cmd_task_dispatch(store, repo, args):
+    task = resolve(store, args.task)
+    event = store.dispatch(task["id"], args.to, expect=_artifact(repo, args.expect),
+                           actor=args.actor, summary=args.summary)
+    print(f"{tag(task)}  {event['summary']}")
+    open_qs = store.blocking_questions(task["id"])
+    if open_qs:
+        print("  note: still blocked by " + ", ".join(
+            f"Q{q['id']} ({q['blocks']})" for q in open_qs))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]], quiet=True)
+    return 0
+
+
+def cmd_task_deliver(store, repo, args):
+    task = resolve(store, args.task)
+    event = store.deliver(task["id"], _artifact(repo, args.artifact),
+                          actor=args.actor, agent=args.agent or None,
+                          summary=args.summary)
+    closed = json.loads(event["payload"]).get("closes")
+    print(f"{tag(task)}  {event['summary']}"
+          + (f"  (closes dispatch #{closed})" if closed else ""))
+    still = store.open_dispatches(task["id"])
+    if still:
+        print("  still out: " + ", ".join(
+            f"{d['agent']}" + (f" → {d['artifact_path']}" if d['artifact_path'] else "")
+            for d in still))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]], quiet=True)
+    return 0
+
+
+def cmd_task_review(store, repo, args):
+    task = resolve(store, args.task)
+    event = store.review(task["id"], args.verdict,
+                         findings=_artifact(repo, args.findings),
+                         actor=args.actor, agent=args.agent or None,
+                         summary=args.summary)
+    print(f"{tag(task)}  {event['summary']}"
+          + (f"  findings {event['artifact_path']}" if event["artifact_path"] else ""))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]], quiet=True)
+    return 0
+
+
+def cmd_task_link(store, repo, args):
+    task = resolve(store, args.task)
+    info = store.session
+    event = store.link_session(task["id"], actor=args.actor)
+    print(f"{tag(task)}  {event['summary']}")
+    print("  " + mhsession.describe(info))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# question
+# ---------------------------------------------------------------------------
+
+def resolve_scope(store, ident):
+    """
+    'aba-champions#37' -> (task, project_key); 'aba-champions' -> (None, key).
+
+    A project key is checked first: a key that happens to end in digits
+    would otherwise be read as key#N.
+    """
+    text = str(ident).strip().strip("`")
+    if store.project(text):
+        return None, text
+    task = resolve(store, text)
+    return task, task["project_key"]
+
+
+def cmd_question_add(store, repo, args):
+    task, project_key = resolve_scope(store, args.scope)
+    try:
+        q = store.add_question(args.text, actor=args.actor,
+                               task_id=task["id"] if task else None,
+                               project_key=project_key,
+                               proposed=args.proposed, blocks=args.blocks)
+    except StoreError as exc:
+        if "already open as" in str(exc):
+            # Not an error for the caller: the question exists, use its id.
+            print(str(exc))
+            return 0
+        raise
+    print(show_question(q, task))
+    if not q["proposed"]:
+        print("  (no proposed answer: a question without one is a research "
+              "task, not a question)")
+    if not args.no_regen:
+        regenerate(store, repo, [project_key], quiet=True)
+    return 0
+
+
+def _print_next_open(store, q):
+    if q["task_id"] is None:
+        return
+    remaining = store.questions(task_id=q["task_id"])
+    if remaining:
+        print(f"\nnext open on this task:")
+        print(show_question(remaining[0]))
+
+
+def cmd_question_answer(store, repo, args):
+    q = store.answer_question(args.id, args.answer, actor=args.actor,
+                              source=args.source)
+    task = store.task(q["task_id"]) if q["task_id"] else None
+    print(show_question(q, task))
+    _print_next_open(store, q)
+    if not args.no_regen:
+        regenerate(store, repo, [q["project_key"]], quiet=True)
+    return 0
+
+
+def cmd_question_accept(store, repo, args):
+    q = store.answer_question(args.id, actor=args.actor, accept=True,
+                              source=args.source)
+    task = store.task(q["task_id"]) if q["task_id"] else None
+    print(show_question(q, task))
+    _print_next_open(store, q)
+    if not args.no_regen:
+        regenerate(store, repo, [q["project_key"]], quiet=True)
+    return 0
+
+
+def cmd_question_withdraw(store, repo, args):
+    q = store.withdraw_question(args.id, actor=args.actor, reason=args.reason)
+    task = store.task(q["task_id"]) if q["task_id"] else None
+    print(show_question(q, task))
+    if not args.no_regen:
+        regenerate(store, repo, [q["project_key"]], quiet=True)
+    return 0
+
+
+def cmd_question_list(store, repo, args):
+    task = project_key = None
+    if args.scope:
+        task, project_key = resolve_scope(store, args.scope)
+    status = None if args.all else "open"
+    if task:
+        rows = store.questions(task_id=task["id"], status=status)
+    elif project_key:
+        rows = store.questions(project_key=project_key, status=status)
+    else:
+        rows = store.questions(status=status)
+    if args.json:
+        out = []
+        for q in rows:
+            item = dict(q)
+            t = store.task(q["task_id"]) if q["task_id"] else None
+            item["task"] = tag(t) if t else None
+            item["task_title"] = t["title"] if t else None
+            item["planned_day"] = t["planned_day"] if t else None
+            out.append(item)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("no open questions" if status == "open" else "no questions")
+        return 0
+    for q in rows:
+        t = store.task(q["task_id"]) if q["task_id"] else None
+        print(show_question(q, t))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# session
+# ---------------------------------------------------------------------------
+
+def cmd_session_show(store, repo, args):
+    info = store.session
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return 0
+    print(mhsession.describe(info))
+    if info.get("session_id"):
+        row = store.session_row(info["session_id"])
+        print("known to the store" if row else "not yet in the store "
+              "(the first write records it)")
     return 0
 
 
@@ -356,8 +644,23 @@ def cmd_task_list(store, repo, args):
     if not rows:
         print("no matching tasks")
         return 0
+    if args.json:
+        out = []
+        for task in rows:
+            item = dict(task)
+            item["tag"] = tag(task)
+            item["dispatch_ready"] = store.dispatch_ready(task["id"])
+            item["open_questions"] = store.questions(task_id=task["id"])
+            item["open_dispatches"] = store.open_dispatches(task["id"])
+            item["last_review"] = store.last_review(task["id"])
+            out.append(item)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
     for task in rows:
         print(show(task))
+        ready = show_readiness(store, task)
+        if ready:
+            print(ready)
     return 0
 
 
@@ -644,6 +947,9 @@ through this.
    touches them. Use `mh task note` to append, or write them directly.
 3. **Every write regenerates the views it affects**, so the markdown you read
    next is never behind the store you just wrote to.
+4. **Every write records which conversation made it.** `mh` finds the
+   Claude session it runs inside on its own; nothing to pass. `--actor` is
+   still yours to give.
 
 ## Identifying a task
 
@@ -702,7 +1008,54 @@ the file if it does not exist. Never rewrites what is there.
 mh task status aba-champions#23 waiting --waiting-on "Sharla's review"
 ```
 
-Moving the row off `waiting` later clears the reason automatically.
+Moving the row off `waiting` later clears the reason automatically. For
+something that waits on **MQ**, ask a question instead (below): a task
+status cannot be answered, a question can.
+
+**Ask MQ something, and propose the answer**
+
+```
+mh question add aba-champions#37 "Hold the VILT at 75 minutes, or run the 90?" \
+    --proposed "90" --blocks "Anushka" --actor orca
+```
+
+Prints `Q41`. Always give `--proposed`: a question without a default answer
+is a research task, not a question, and the cheapest reply MQ can give is
+Accept. `--blocks` names who is waiting; a question from a person creates
+an obligation, a question from an agent does not. A near-duplicate of an
+open question on the same task is refused and the existing id printed.
+
+MQ answers in the session manager, or by id from anywhere:
+
+```
+mh question accept 41                              # answer = proposed
+mh question answer 41 "run the 90" --source slack  # her own words
+mh question list aba-champions#37                  # what is still open
+mh question list --open --json                     # for the Friday job
+```
+
+**Record what an agent did**
+
+```
+mh task dispatch aba-champions#37 --to iddy --expect path/to/draft.md --actor orca
+mh task deliver  aba-champions#37 --artifact path/to/draft.md --actor iddy
+mh task review   aba-champions#37 --verdict back --findings path/to/findings.md --actor revi
+```
+
+Each is one event on the task page. `deliver` closes the newest open
+dispatch for the same agent; when Orca records on a subagent's behalf, pass
+`--agent <name>`. A task is **dispatch-ready** when it has a brief and no
+open question that blocks anyone; nothing sets that by hand.
+
+**Show this conversation on a task**
+
+```
+mh task link aba-champions#37
+```
+
+Every `mh` write already records which Claude conversation made it (see
+`mh session show`), so this is only needed for a conversation that has not
+written anything yet.
 
 ## Safety
 
@@ -823,10 +1176,75 @@ def build_parser():
     p.add_argument("task")
     p.set_defaults(fn=cmd_task_confirm)
 
-    p = task.add_parser("brief", help="record a brief file path", parents=[common])
+    p = task.add_parser("brief", help="record a brief file path (must exist, under the repo)", parents=[common])
     p.add_argument("task")
     p.add_argument("path")
     p.set_defaults(fn=cmd_task_brief)
+
+    p = task.add_parser("dispatch", help="record that work went to an agent", parents=[common])
+    p.add_argument("task")
+    p.add_argument("--to", required=True, help="the agent it went to")
+    p.add_argument("--expect", help="repo-relative path the deliverable should land at")
+    p.add_argument("--summary", help="one line for the task page")
+    p.set_defaults(fn=cmd_task_dispatch)
+
+    p = task.add_parser("deliver", help="record a deliverable; closes the open dispatch", parents=[common])
+    p.add_argument("task")
+    p.add_argument("--artifact", required=True, help="repo-relative path of what was delivered")
+    p.add_argument("--agent", help="who did the work, when recording for a subagent")
+    p.add_argument("--summary", help="one line for the task page")
+    p.set_defaults(fn=cmd_task_deliver)
+
+    p = task.add_parser("review", help="record a reviewer's verdict", parents=[common])
+    p.add_argument("task")
+    p.add_argument("--verdict", required=True, choices=mhstore.VERDICTS)
+    p.add_argument("--findings", help="repo-relative path of the findings")
+    p.add_argument("--agent", help="which reviewer, when recording for a subagent")
+    p.add_argument("--summary", help="one line for the task page")
+    p.set_defaults(fn=cmd_task_review)
+
+    p = task.add_parser("link", help="show this conversation on the task's page", parents=[common])
+    p.add_argument("task")
+    p.set_defaults(fn=cmd_task_link)
+
+    question = sub.add_parser("question", help="questions for MQ",
+                              parents=[common]).add_subparsers(
+        dest="action", required=True)
+
+    p = question.add_parser("add", help="ask MQ something; always propose an answer", parents=[common])
+    p.add_argument("scope", help="key#N for a task, or a project key")
+    p.add_argument("text")
+    p.add_argument("--proposed", help="your default answer, so Accept is one click")
+    p.add_argument("--blocks", help="who or what waits on this (a person, a session)")
+    p.set_defaults(fn=cmd_question_add)
+
+    p = question.add_parser("answer", help="record MQ's answer", parents=[common])
+    p.add_argument("id", type=_question_id, help="the question id, 41 or Q41")
+    p.add_argument("answer")
+    p.add_argument("--source", help="where the answer came from: dashboard, slack, context.md, a path")
+    p.set_defaults(fn=cmd_question_answer)
+
+    p = question.add_parser("accept", help="answer = the proposed answer", parents=[common])
+    p.add_argument("id", type=_question_id)
+    p.add_argument("--source")
+    p.set_defaults(fn=cmd_question_accept)
+
+    p = question.add_parser("withdraw", help="the question no longer applies", parents=[common])
+    p.add_argument("id", type=_question_id)
+    p.add_argument("--reason")
+    p.set_defaults(fn=cmd_question_withdraw)
+
+    p = question.add_parser("list", help="open questions, in the order the dashboard shows them", parents=[common])
+    p.add_argument("scope", nargs="?", help="key#N or a project key; omit for all")
+    p.add_argument("--open", action="store_true", help="open only (the default)")
+    p.add_argument("--all", action="store_true", help="include answered and withdrawn")
+    p.set_defaults(fn=cmd_question_list)
+
+    session = sub.add_parser("session", help="the conversation mh is running in",
+                             parents=[common]).add_subparsers(
+        dest="action", required=True)
+    p = session.add_parser("show", help="what the store thinks this conversation is", parents=[common])
+    p.set_defaults(fn=cmd_session_show)
 
     plan = sub.add_parser("plan", help="the week",
                           parents=[common]).add_subparsers(
