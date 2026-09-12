@@ -5660,14 +5660,20 @@ function showConversationPicker(taskId) {
     if (!el) return;
     el.classList.add('open');          // renderTask leaves the picker alone while it is open
     el.innerHTML = `<div style="width:100%;font-size:11px;color:var(--text-dim);margin-bottom:2px">Pick the conversation that is about this task:</div>` +
-        scored.slice(0, 12).map(({s, hits}) => `<button class="panel-btn" onclick="linkConversation(${taskId}, '${escAttr(s.itermId)}')"
+        scored.slice(0, 12).map(({s, hits}) => `<button class="panel-btn" onclick="linkConversation(${taskId}, '${escAttr(s.itermId)}', this)"
             title="${escAttr(s.shortCwd || '')}">${s.isInactive ? '' : '<span class="card-status ' + escAttr(s.cardState || 'ready') + '" style="display:inline-block;margin-right:4px"></span>'}${escHtml(s.name.slice(0, 48))}${hits ? ' <span style="opacity:0.5">' + hits + '</span>' : ''}</button>`).join('') +
         `<button class="panel-btn" onclick="this.parentElement.classList.remove('open');renderTask()">cancel</button>`;
 }
 
-async function linkConversation(taskId, itermId) {
+async function linkConversation(taskId, itermId, btn) {
+    // Close the picker before refreshing: renderTask refuses to redraw while
+    // it is open, so leaving it there hid the very row the click created.
+    if (btn) { btn.disabled = true; btn.textContent = 'linking…'; }
+    const picker = document.getElementById('convPick');
+    if (picker) picker.classList.remove('open');
     const ok = await storeAction('task/link', {itermId, taskId});
     if (!ok) alert('Could not link that conversation.');
+    lastTaskJson = null;
     fetchTask(true);
 }
 

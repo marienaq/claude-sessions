@@ -436,6 +436,12 @@ class TestFrontEnd(unittest.TestCase):
         self.assertIn("openTask(${ta.taskId})", self.js)
         self.assertIn('onclick="openTask(${t.id})"', self.js, "strip chips")
 
+    def test_linking_a_conversation_closes_the_picker_before_redrawing(self):
+        """The open picker blocks redraws; leaving it open hid the new row."""
+        body = self.js.split("async function linkConversation(", 1)[1].split("\nasync function ", 1)[0]
+        self.assertLess(body.index("classList.remove('open')"), body.index("storeAction("))
+        self.assertIn("fetchTask(true)", body)
+
     def test_escape_does_not_close_over_an_open_answer_box(self):
         self.assertIn("e.key === 'Escape' && openTaskId && !document.querySelector('#taskView .answer-input')", self.js)
 
