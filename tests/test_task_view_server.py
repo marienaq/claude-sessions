@@ -332,6 +332,43 @@ class TestWrites(TaskViewCase):
         self.assertFalse(self.server.resolve_task_assignments(state), "not retried")
 
 
+class TestLoad(TaskViewCase):
+
+    def test_task_endpoints_never_rescan_sessions(self):
+        """
+        The popup must ride on the board's last poll. Rescanning on a stale
+        cache doubled the load on a single-threaded server while iTerm was
+        slow, and the page read as hung.
+        """
+        calls = []
+        self.server.get_all_sessions = lambda: calls.append(1) or []
+        self.server._SESSIONS_CACHE["at"] = 1          # a poll happened once, long ago
+        for _ in range(3):
+            self.get(f"/api/task/{self.task['id']}")
+            self.get("/api/tasks")
+        self.assertEqual(calls, [])
+
+    def test_iterm_timeout_backs_off_and_keeps_the_last_scan(self):
+        import subprocess
+        server = self.server
+        good = [{"name": "tab", "tty": "/dev/ttys001", "itermId": "X", "color": ""}]
+        server._ITERM_CACHE["sessions"] = list(good)
+        server._ITERM_CACHE["backoff_until"] = 0
+        real_run = subprocess.run
+
+        def slow(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="osascript", timeout=5)
+        server.subprocess.run = slow
+        try:
+            self.assertEqual(server.get_iterm_sessions(), good)
+            self.assertGreater(server._ITERM_CACHE["backoff_until"], time.time())
+            server.subprocess.run = lambda *a, **k: self.fail("scanned during backoff")
+            self.assertEqual(server.get_iterm_sessions(), good)
+        finally:
+            server.subprocess.run = real_run
+            server._ITERM_CACHE["backoff_until"] = 0
+
+
 class TestOrcaLauncher(TaskViewCase):
 
     def _transcript(self, sid, age_days=1):

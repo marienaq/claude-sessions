@@ -183,7 +183,17 @@ end tell
 """
 
 
+# iTerm answers AppleScript on its main thread, so while it is busy the
+# scan times out at five seconds, which is the whole poll interval: the
+# server falls behind and every request after that queues. After a timeout
+# the last good list is reused and the scan is skipped for a while.
+_ITERM_CACHE = {"sessions": [], "backoff_until": 0}
+ITERM_BACKOFF = 30
+
+
 def get_iterm_sessions():
+    if time.time() < _ITERM_CACHE["backoff_until"]:
+        return _ITERM_CACHE["sessions"]
     try:
         result = subprocess.run(
             ["osascript", "-e", ITERM_SCRIPT],
@@ -201,10 +211,16 @@ def get_iterm_sessions():
                     "itermId": parts[2],
                     "color": parts[3] if len(parts) > 3 else "",
                 })
+        _ITERM_CACHE["sessions"] = sessions
         return sessions
+    except subprocess.TimeoutExpired:
+        print(f"iTerm2 AppleScript timed out; reusing the last scan for "
+              f"{ITERM_BACKOFF}s")
+        _ITERM_CACHE["backoff_until"] = time.time() + ITERM_BACKOFF
+        return _ITERM_CACHE["sessions"]
     except Exception as e:
         print(f"iTerm2 AppleScript error: {e}")
-        return []
+        return _ITERM_CACHE["sessions"]
 
 
 # ---------------------------------------------------------------------------
@@ -752,13 +768,15 @@ def _event_item(e):
 
 # The board's session list is expensive (AppleScript, ps, a transcript scan)
 # and already computed every five seconds for /api/sessions. The task page
-# joins against that result rather than computing its own.
+# joins against that result and never computes its own: while MQ types an
+# answer the board poll pauses, and a task endpoint that rescanned on a
+# stale cache doubled the load on a single-threaded server at exactly the
+# moment iTerm was slowest. A list a minute old is fine for a popup.
 _SESSIONS_CACHE = {"at": 0, "sessions": []}
-SESSIONS_CACHE_TTL = 10
 
 
 def cached_sessions():
-    if time.time() - _SESSIONS_CACHE["at"] > SESSIONS_CACHE_TTL:
+    if not _SESSIONS_CACHE["at"]:
         _SESSIONS_CACHE["sessions"] = get_all_sessions()
         _SESSIONS_CACHE["at"] = time.time()
     return _SESSIONS_CACHE["sessions"]
@@ -5743,6 +5761,10 @@ if __name__ == "__main__":
         STORE_FILE = MELLONHEAD_ROOT / "operations" / "tasks.db"
 
     SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Two browsers polling two endpoints every five seconds, plus their
+    # retries after any stall, overflow the default backlog of five; the
+    # kernel then drops SYNs and the page reads as hung.
+    http.server.HTTPServer.request_queue_size = 64
     server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Claude Session Manager running at http://localhost:{PORT}")
     print(f"  repo:  {MELLONHEAD_ROOT}")
