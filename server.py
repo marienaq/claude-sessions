@@ -6,6 +6,7 @@ Zero dependencies: Python 3 stdlib only.
 
 import http.server
 import json
+import threading
 import os
 import re
 import shlex
@@ -2157,9 +2158,37 @@ def activate_iterm_session(iterm_id):
 # HTTP Server
 # ---------------------------------------------------------------------------
 
+# One request at a time, as before. The server is threaded only so that a
+# browser's idle keep-alive connection waits in its own thread instead of
+# blocking the accept loop; everything that touches the store, the session
+# scan or AppleScript still runs under this lock, so nothing here needs to
+# be re-entrant.
+_HANDLER_LOCK = threading.Lock()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    # HTTP/1.1 so the browsers reuse a connection across polls. With 1.0 every
+    # poll opened a new one; the kernel's TIME_WAIT pile on 7433 grew past
+    # four thousand and stopped answering fresh SYNs, and the page hung.
+    protocol_version = "HTTP/1.1"
+    # An idle keep-alive connection is dropped after this many seconds.
+    timeout = 75
+
     def log_message(self, format, *args):
         pass  # Suppress default logging
+
+    def do_GET(self):
+        with _HANDLER_LOCK:
+            self._do_GET()
+
+    def do_POST(self):
+        with _HANDLER_LOCK:
+            self._do_POST()
+
+    def not_found(self):
+        # send_error carries a Content-Length; a bare 404 without one leaves
+        # a keep-alive client waiting for a body that never comes.
+        self.send_error(404)
 
     def send_json(self, data, status=200):
         body = json.dumps(data).encode()
@@ -2181,7 +2210,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length)) if length else {}
 
-    def do_GET(self):
+    def _do_GET(self):
         if self.path == "/api/sessions":
             store = load_store()
             self.send_json({
@@ -2253,10 +2282,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.split("?", 1)[0] == "/":
             self.send_html(HTML_PAGE)
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.not_found()
 
-    def do_POST(self):
+    def _do_POST(self):
         if self.path == "/api/navigate":
             body = self.read_body()
             iterm_id = body.get("itermId", "")
@@ -3043,8 +3071,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok": True})
 
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.not_found()
 
 
 # ---------------------------------------------------------------------------
@@ -5764,8 +5791,9 @@ if __name__ == "__main__":
     # Two browsers polling two endpoints every five seconds, plus their
     # retries after any stall, overflow the default backlog of five; the
     # kernel then drops SYNs and the page reads as hung.
-    http.server.HTTPServer.request_queue_size = 64
-    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    http.server.ThreadingHTTPServer.request_queue_size = 64
+    http.server.ThreadingHTTPServer.daemon_threads = True
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Claude Session Manager running at http://localhost:{PORT}")
     print(f"  repo:  {MELLONHEAD_ROOT}")
     print(f"  state: {STATE_DIR}")
