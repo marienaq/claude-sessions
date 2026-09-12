@@ -846,7 +846,9 @@ class Store:
         cols = {
             "project_key": project_key, "title": title, "status": status,
             "status_raw": fields.get("status_raw"),
-            "owner": fields.get("owner", "mq"),
+            # Folded on write: the store held mq 241, MQ 65 and Devi 5 before
+            # this, because add --owner passed the string straight through.
+            "owner": normalize_owner(fields.get("owner", "mq")),
             "seq": fields.get("seq"),
             "is_next": 1 if fields.get("is_next") else 0,
             "section": fields.get("section"),
@@ -894,6 +896,8 @@ class Store:
             raise StoreError(f"bad load {fields['load']!r}")
         if fields.get("depends_on") == task_id:
             raise StoreError("a task cannot depend on itself")
+        if "owner" in fields:
+            fields["owner"] = normalize_owner(fields["owner"])
         if not fields:
             return before
 

@@ -15,6 +15,10 @@ Two things, both reviewed as a printed diff before anything is written:
                its project (task_id null), and close the task row with a
                note pointing at the question id.
 
+  owners       Fold owner spellings (MQ, Mariena, Devi) onto the store's
+               lower-case form, one audited update per row. The store
+               normalizes on write from schema 2 on; this catches up.
+
 Deliberately not done: importing the blank `**MQ:**` slots from briefs.
 Task note #242 shows most of them were answered elsewhere, and importing
 them would recreate the false blockers this whole design exists to remove.
@@ -91,6 +95,11 @@ def plan_questions(store):
     return actions
 
 
+def plan_owners(store):
+    return [(task, mhstore.normalize_owner(task["owner"])) for task in store.tasks()
+            if task["owner"] != mhstore.normalize_owner(task["owner"])]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--repo", type=Path,
@@ -127,6 +136,17 @@ def main(argv=None):
         if not questions:
             print("  (no open Question: rows)")
 
+        owners = plan_owners(store)
+        print("\nowners:")
+        by_change = {}
+        for task, folded in owners:
+            by_change.setdefault((task["owner"], folded), 0)
+            by_change[(task["owner"], folded)] += 1
+        for (raw, folded), n in sorted(by_change.items()):
+            print(f"  FOLD  {raw!r:<12} -> {folded!r:<12} {n} row(s)")
+        if not owners:
+            print("  (every owner is already lower-case)")
+
         if not args.apply:
             print("\ndry run; pass --apply to write.")
             return 0
@@ -149,6 +169,11 @@ def main(argv=None):
                 store.complete_task(task["id"], actor=args.actor)
                 touched.add(task["project_key"])
                 print(f"  wrote Q{q['id']} for #{task['id']}")
+            for task, folded in owners:
+                store.update_task(task["id"], actor=args.actor, owner=folded)
+                touched.add(task["project_key"])
+            if owners:
+                print(f"  folded {len(owners)} owner(s)")
         for key in sorted(touched):
             if key != mhstore.ONE_OFF:
                 mhgen.generate_task_list(store, repo, key)

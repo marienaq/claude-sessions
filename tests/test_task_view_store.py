@@ -561,6 +561,31 @@ class TestVerbs(StoreCase):
         self.assertTrue(rows[0]["dispatch_ready"])
         self.assertEqual(rows[0]["open_dispatches"][0]["agent"], "iddy")
 
+    def test_owner_is_folded_on_every_write(self):
+        t = self.store.add_task("proj", "Hers", owner="MQ")
+        self.assertEqual(t["owner"], "mq")
+        t = self.store.add_task("proj", "Theirs", owner="Devi")
+        self.assertEqual(t["owner"], "devi")
+        self.store.update_task(t["id"], owner="Mariena")
+        self.assertEqual(self.store.task(t["id"])["owner"], "mq")
+
+    def test_backfill_folds_existing_owners(self):
+        import backfill_task_view
+        self.store.conn.execute("UPDATE tasks SET owner = 'MQ' WHERE id = ?", (self.task["id"],))
+        other = self.store.add_task("proj", "Theirs", display_ord="2")
+        self.store.conn.execute("UPDATE tasks SET owner = 'Devi' WHERE id = ?", (other["id"],))
+        plan = backfill_task_view.plan_owners(self.store)
+        self.assertEqual(sorted(f for _, f in plan), ["devi", "mq"])
+        self.store.close()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = backfill_task_view.main(["--repo", str(self.repo), "--apply"])
+        self.assertEqual(code, 0, buf.getvalue())
+        self.assertIn("folded 2 owner(s)", buf.getvalue())
+        self.store = mhstore.open_store(root=self.repo)
+        self.assertEqual({t["owner"] for t in self.store.tasks()}, {"mq", "devi"})
+        self.assertEqual(backfill_task_view.plan_owners(self.store), [])
+
     def test_owner_hands_a_task_over_and_back(self):
         code, out = self.run_cli("task", "owner", "proj#1", "Anushka", "--actor", "orca")
         self.assertEqual(code, 0, out)
