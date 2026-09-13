@@ -561,6 +561,49 @@ class TestVerbs(StoreCase):
         self.assertTrue(rows[0]["dispatch_ready"])
         self.assertEqual(rows[0]["open_dispatches"][0]["agent"], "iddy")
 
+    def test_task_set_changes_plain_fields(self):
+        code, out = self.run_cli("task", "set", "proj#1", "--title", "Build the other thing",
+                                 "--due", "2026-09-30", "--notes", "One line.", "--actor", "devi")
+        self.assertEqual(code, 0, out)
+        t = self.store.task(self.task["id"])
+        self.assertEqual((t["title"], t["due"], t["notes"]),
+                         ("Build the other thing", "2026-09-30", "One line."))
+        ev = self.events(task_id=self.task["id"])[-1]
+        self.assertEqual(ev["actor"], "devi")
+        self.assertIn("retitled: Build the other thing", ev["summary"])
+        self.assertIn("Build the other thing", (self.repo / "proj" / "task-list.md").read_text())
+        other = self.store.add_task("proj", "Blocker", display_ord="2")
+        self.run_cli("task", "set", "proj#1", "--depends-on", "proj#2")
+        self.assertEqual(self.store.task(self.task["id"])["depends_on"], other["id"])
+        self.run_cli("task", "set", "proj#1", "--due", "none", "--depends-on", "none")
+        t = self.store.task(self.task["id"])
+        self.assertIsNone(t["due"])
+        self.assertIsNone(t["depends_on"])
+
+    def test_task_set_refuses_nothing_and_empty_titles(self):
+        code, _ = self.run_cli("task", "set", "proj#1")
+        self.assertEqual(code, 1)
+        code, _ = self.run_cli("task", "set", "proj#1", "--title", "  ")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.store.task(self.task["id"])["title"], "Build the thing")
+
+    def test_project_set_renames_and_moves(self):
+        code, out = self.run_cli("project", "set", "proj", "--name", "The Project",
+                                 "--due", "2026-12-01", "--owner", "MQ")
+        self.assertEqual(code, 0, out)
+        p = self.store.project("proj")
+        self.assertEqual((p["name"], p["due"], p["owner"]), ("The Project", "2026-12-01", "mq"))
+        self.assertIn("project-registry.md", out)
+        code, out = self.run_cli("project", "set", "proj", "--dir", "nowhere")
+        self.assertEqual(code, 1)
+        (self.repo / "moved").mkdir()
+        code, out = self.run_cli("project", "set", "proj", "--dir", "./moved")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.store.project("proj")["dir"], "moved")
+        self.assertIn("no task-list.md at moved", out)
+        ev = self.store.events(project_key=None, kind="project", limit=1)[0]
+        self.assertEqual(ev["actor"], "agent")
+
     def test_owner_is_folded_on_every_write(self):
         t = self.store.add_task("proj", "Hers", owner="MQ")
         self.assertEqual(t["owner"], "mq")
@@ -622,7 +665,8 @@ class TestReferenceAndChecker(unittest.TestCase):
     def test_committed_reference_includes_the_new_verbs(self):
         text = (Path(__file__).resolve().parent.parent / "mh-reference.md").read_text()
         for verb in ("mh task dispatch", "mh task deliver", "mh task review",
-                     "mh task link", "mh task unlink", "mh task owner", "mh question add", "mh question answer",
+                     "mh task link", "mh task unlink", "mh task owner", "mh task set",
+                     "mh project set", "mh question add", "mh question answer",
                      "mh question accept", "mh question list", "mh session show"):
             self.assertIn(verb, text)
 

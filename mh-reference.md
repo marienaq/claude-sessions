@@ -48,6 +48,7 @@ works as-is.
 | `mh task note <task> <text>` | — | append a dated entry to the note file |
 | `mh task plan <task> <day>` | — | put a task on a day, or take it off |
 | `mh task load <task> <load>` | — | set a task's load tag |
+| `mh task set <task>` | `--depends-on` `--due` `--notes` `--notion` `--section` `--title` | change a task's title, notes, due, section, dependency or Notion id |
 | `mh task owner <task> <owner>` | — | hand a task to someone (mq, or a person's name) |
 | `mh task seq <task> <seq>` | — | set ordering within a project |
 | `mh task confirm <task>` | — | accept a capture proposal |
@@ -88,6 +89,7 @@ works as-is.
 |---|---|---|
 | `mh project add <key> <name>` | `--dir` `--due` `--goal` `--notion` `--owner` `--status` | register a new project |
 | `mh project list` | `--all` | every live project, with its next action |
+| `mh project set <project>` | `--dir` `--due` `--goal` `--name` `--notion` `--owner` | rename a project, move its directory, or fix due, goal, owner |
 | `mh project status <project> <status>` | — | set a project's status |
 
 ### Single commands
@@ -156,6 +158,29 @@ mh task status aba-champions#23 waiting --waiting-on "Sharla's review"
 Moving the row off `waiting` later clears the reason automatically. For
 something that waits on **MQ**, ask a question instead (below): a task
 status cannot be answered, a question can.
+
+**Fix a task's title, note, due date or section**
+
+```
+mh task set aba-champions#37 --title "Build the first agent: session plan"
+mh task set aba-champions#37 --due 2026-09-30 --notes "Anushka co-leads."
+mh task set aba-champions#37 --depends-on aba-champions#36
+```
+
+`none` clears a field (`--due none`). Status, day, load, owner and seq
+keep their own verbs. **Never edit `tasks.db` with sqlite3**: a change made
+that way has no audit line, no event, and no regeneration.
+
+**Rename a project or move its directory**
+
+```
+mh project set gamma-event --name "LA Tech Week CHRO roundtable"
+mh project set gamma-event --dir marketing/2026-10-chro-roundtable
+```
+
+The directory must exist and hold the project's `task-list.md`; the
+registry row in `operations/project-registry.md` is hand-written and is
+yours to update.
 
 **Hand a task to someone else**
 

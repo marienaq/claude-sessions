@@ -385,6 +385,49 @@ def cmd_plan_propose(store, repo, args):
     return 0
 
 
+def cmd_task_set(store, repo, args):
+    """
+    Change the fields that have no verb of their own.
+
+    Retitling, fixing a note, setting a due date or a section were being
+    done with sqlite3 by hand, outside the audit log. Status, day, load,
+    owner and seq keep their verbs because each carries a rule; these are
+    plain fields.
+    """
+    task = resolve(store, args.task)
+    fields = {}
+    if args.title is not None:
+        title = args.title.strip()
+        if not title:
+            raise CliError("a title cannot be empty")
+        fields["title"] = title
+    if args.notes is not None:
+        fields["notes"] = args.notes.strip() or None
+    if args.due is not None:
+        fields["due"] = _blank_is_none(args.due)
+    if args.section is not None:
+        fields["section"] = _blank_is_none(args.section)
+    if args.notion is not None:
+        fields["notion_task_id"] = _blank_is_none(args.notion)
+    if args.depends_on is not None:
+        if _blank_is_none(args.depends_on) is None:
+            fields["depends_on"] = None
+        else:
+            fields["depends_on"] = resolve(store, args.depends_on)["id"]
+    if not fields:
+        raise CliError("nothing to set; see `mh task set --help`")
+    store.update_task(task["id"], actor=args.actor, **fields)
+    print(show(store.task(task["id"])))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
+def _blank_is_none(value):
+    """'none', '-' or '' clears a field; anything else is the value."""
+    return mhstore.clean(value)
+
+
 def cmd_task_owner(store, repo, args):
     """
     Hand a task to someone, or take it back.
@@ -771,6 +814,52 @@ def cmd_project_add(store, repo, args):
     return 0
 
 
+def cmd_project_set(store, repo, args):
+    """
+    Rename a project, move its directory, or fix its due, goal or owner.
+
+    A moved directory needs the task list to move with it: the generator
+    writes to <dir>/task-list.md and does nothing if the file is not there.
+    project-registry.md is hand-written and is reminded about, not edited.
+    """
+    if not store.project(args.project):
+        raise CliError(f"no project {args.project!r}; see `mh project list`")
+    fields = {}
+    if args.name is not None:
+        name = args.name.strip()
+        if not name:
+            raise CliError("a name cannot be empty")
+        fields["name"] = name
+    if args.dir is not None:
+        rel = _repo_relative(repo, args.dir)
+        if not (repo / rel).is_dir():
+            raise CliError(f"no such directory under the repo: {rel}")
+        fields["dir"] = rel
+    if args.due is not None:
+        fields["due"] = _blank_is_none(args.due)
+    if args.goal is not None:
+        fields["goal"] = _blank_is_none(args.goal)
+    if args.owner is not None:
+        fields["owner"] = mhstore.normalize_owner(args.owner)
+    if args.notion is not None:
+        fields["notion_project_id"] = _blank_is_none(args.notion)
+    if not fields:
+        raise CliError("nothing to set; see `mh project set --help`")
+    project = store.update_project(args.project, actor=args.actor, **fields)
+    print(f"{project['key']:<18} {project['status']:<9} {project['name']}")
+    if project["dir"]:
+        print(f"  dir: {project['dir']}")
+    if "dir" in fields and not (repo / project["dir"] / "task-list.md").exists():
+        print(f"  note: no task-list.md at {project['dir']}; move the old one "
+              "there or the list will not regenerate.")
+    if "dir" in fields or "name" in fields:
+        print("  update the row in operations/project-registry.md too; it is "
+              "hand-written.")
+    if not args.no_regen:
+        regenerate(store, repo, [args.project])
+    return 0
+
+
 def cmd_project_status(store, repo, args):
     status = mhstore.normalize_project_status(args.status)
     store.update_project(args.project, actor=args.actor, status=status)
@@ -1041,6 +1130,29 @@ Moving the row off `waiting` later clears the reason automatically. For
 something that waits on **MQ**, ask a question instead (below): a task
 status cannot be answered, a question can.
 
+**Fix a task's title, note, due date or section**
+
+```
+mh task set aba-champions#37 --title "Build the first agent: session plan"
+mh task set aba-champions#37 --due 2026-09-30 --notes "Anushka co-leads."
+mh task set aba-champions#37 --depends-on aba-champions#36
+```
+
+`none` clears a field (`--due none`). Status, day, load, owner and seq
+keep their own verbs. **Never edit `tasks.db` with sqlite3**: a change made
+that way has no audit line, no event, and no regeneration.
+
+**Rename a project or move its directory**
+
+```
+mh project set gamma-event --name "LA Tech Week CHRO roundtable"
+mh project set gamma-event --dir marketing/2026-10-chro-roundtable
+```
+
+The directory must exist and hold the project's `task-list.md`; the
+registry row in `operations/project-registry.md` is hand-written and is
+yours to update.
+
 **Hand a task to someone else**
 
 ```
@@ -1210,6 +1322,16 @@ def build_parser():
     p.add_argument("load", choices=(*mhstore.LOADS, "none"))
     p.set_defaults(fn=cmd_task_load)
 
+    p = task.add_parser("set", help="change a task's title, notes, due, section, dependency or Notion id", parents=[common])
+    p.add_argument("task")
+    p.add_argument("--title", help="the new title")
+    p.add_argument("--notes", help="one sentence, rendered inline; 'none' clears")
+    p.add_argument("--due", help="YYYY-MM-DD; 'none' clears")
+    p.add_argument("--section", help="the sub-heading its table sits under; 'none' clears")
+    p.add_argument("--depends-on", help="key#N it waits for; 'none' clears")
+    p.add_argument("--notion", help="Notion task id; 'none' clears")
+    p.set_defaults(fn=cmd_task_set)
+
     p = task.add_parser("owner", help="hand a task to someone (mq, or a person's name)", parents=[common])
     p.add_argument("task")
     p.add_argument("owner", help="who does the work; MQ and Mariena fold to mq")
@@ -1332,6 +1454,16 @@ def build_parser():
     p = project.add_parser("list", help="every live project, with its next action", parents=[common])
     p.add_argument("--all", action="store_true", help="include archived")
     p.set_defaults(fn=cmd_project_list)
+    p = project.add_parser("set", help="rename a project, move its directory, or fix due, goal, owner", parents=[common])
+    p.add_argument("project")
+    p.add_argument("--name")
+    p.add_argument("--dir", help="repo-relative directory holding its task-list.md")
+    p.add_argument("--due", help="YYYY-MM-DD; 'none' clears")
+    p.add_argument("--goal", help="'none' clears")
+    p.add_argument("--owner")
+    p.add_argument("--notion", help="Notion project id; 'none' clears")
+    p.set_defaults(fn=cmd_project_set)
+
     p = project.add_parser("status", help="set a project's status", parents=[common])
     p.add_argument("project")
     p.add_argument("status")

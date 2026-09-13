@@ -496,6 +496,8 @@ def event_summary(kind, action, before, after):
         return "setting " + ", ".join(f"{k}={v}" for k, v in after.items())
     if isinstance(after, dict) and "owner" in after:
         return f"owner {before.get('owner')} → {after['owner']}"
+    if isinstance(after, dict) and "title" in after:
+        return f"retitled: {after['title']}"
     changed = ", ".join(f"{k}={after[k]}" for k in after) if isinstance(after, dict) else ""
     return changed or action
 
