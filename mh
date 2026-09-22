@@ -43,11 +43,11 @@ PYTHON=""
 for py in "${CSM_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3 \
           "$(command -v python3 2>/dev/null)"; do
     [ -n "$py" ] && [ -x "$py" ] || continue
-    "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
+    "$py" -c 'import sys, sqlite3; sys.exit(sys.version_info < (3, 11) or sqlite3.sqlite_version_info < (3, 24))' 2>/dev/null \
         && { PYTHON="$py"; break; }
 done
 if [ -z "$PYTHON" ]; then
-    echo "mh: needs Python 3.11 or newer. Install one (brew install python)" >&2
+    echo "mh: needs Python 3.11 or newer with sqlite3. Install one (brew install python)" >&2
     echo "    or point \$CSM_PYTHON at it." >&2
     exit 127
 fi

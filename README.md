@@ -21,7 +21,10 @@ When you're running 15+ Claude Code sessions across iTerm2 tabs, it becomes hard
 - **iTerm2.** The dashboard only sees Claude Code sessions running in iTerm2
   tabs. Sessions in Terminal.app, Warp, VS Code or an IDE do not appear.
 - **Python 3.11 or newer.** The stock `/usr/bin/python3` on macOS is too old;
-  `brew install python` is the usual fix. Nothing to `pip install`.
+  `brew install python` is the usual fix. Nothing to `pip install`, and no
+  database to set up: the task store is SQLite, which ships inside Python.
+  (A pyenv Python built without SQLite headers lacks it; the installer
+  checks.)
 - **Claude Code** (`claude`) on your PATH, for resuming conversations and
   opening new ones from the dashboard.
 

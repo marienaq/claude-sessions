@@ -85,7 +85,7 @@ say "Checking requirements"
 ok "macOS"
 
 . "$HERE/find-python.sh"
-find_python || die "Python 3.11 or newer not found. Install it (brew install python) or set CSM_PYTHON."
+find_python || die "Python 3.11 or newer, with sqlite3, not found. Install it (brew install python) or set CSM_PYTHON."
 ok "Python: $PYTHON ($("$PYTHON" -c 'import platform; print(platform.python_version())'))"
 
 if [ -d /Applications/iTerm.app ] || [ -d "$HOME/Applications/iTerm.app" ]; then
