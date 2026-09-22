@@ -1,6 +1,6 @@
 # Claude Session Manager
 
-A local dashboard for managing multiple Claude Code conversations running in iTerm2. Built as a single Python file with zero external dependencies.
+A local dashboard for managing multiple Claude Code conversations running in iTerm2, with an optional task store and CLI (`mh`) behind it. Python standard library only.
 
 ## What it does
 
@@ -15,53 +15,159 @@ When you're running 15+ Claude Code sessions across iTerm2 tabs, it becomes hard
 - **Groups by priority**: Today, This Week, Ongoing, Next Week, Later
 - **Supports dark mode**
 
-## Quick start
+## Requirements
+
+- **macOS.** Sessions are found through AppleScript.
+- **iTerm2.** The dashboard only sees Claude Code sessions running in iTerm2
+  tabs. Sessions in Terminal.app, Warp, VS Code or an IDE do not appear.
+- **Python 3.11 or newer.** The stock `/usr/bin/python3` on macOS is too old;
+  `brew install python` is the usual fix. Nothing to `pip install`.
+- **Claude Code** (`claude`) on your PATH, for resuming conversations and
+  opening new ones from the dashboard.
+
+## Install
 
 ```bash
-# Start the server
-python3 ~/Projects/claude-sessions/server.py
-
-# Or double-click the desktop shortcut
-open ~/Desktop/Claude\ Sessions.command
+git clone https://github.com/marienaq/claude-sessions.git ~/Projects/claude-sessions
+cd ~/Projects/claude-sessions
+./install.sh
 ```
 
-Then open http://localhost:7433 in your browser.
+The installer asks four things, with a sensible default for each:
+
+| Question | What it is for |
+|---|---|
+| **User id** (e.g. `alex`) | You, as the task store knows you. Tasks you own, and everything you do on the dashboard, carry it. Lower case, no spaces. |
+| **Display name** (e.g. `Alex`) | How the dashboard and the generated markdown refer to you ("Alex has next step"). |
+| **Other names** | Spellings an agent might use when handing a task to you (a full name, initials). They fold to your id. |
+| **Workspace directory** | Where your `priorities.md`, per-project `task-list.md` files and the task store (`operations/tasks.db`) live. Any directory; it is created if missing. |
+
+It then offers, each one optional:
+
+1. **Create the task store** and install the `mh` CLI into the workspace
+   (`<workspace>/operations/mh`), with a symlink at `~/.local/bin/mh`.
+2. **Add a Claude Code SessionStart hook** so Claude sees the dashboard's
+   todo list for the tab it starts in. Edits `~/.claude/settings.json`,
+   backing it up to `settings.json.bak` first.
+3. **Start at login**: two LaunchAgents, one for the server and one that
+   opens the browser once the server is up.
+
+Non-interactive: `./install.sh --user alex --name Alex --root ~/Projects/work --yes`.
+`--no-store`, `--no-hook` and `--no-autostart` skip steps; `--help` lists
+everything. Re-running is safe: it detects what is already set up.
+
+### First run
+
+Open http://localhost:7433, or double-click `launch.command` if you skipped
+auto-start. The first time the server talks to iTerm2, **macOS asks whether
+it may control iTerm2. Allow it**, or no sessions appear. If you missed the
+prompt: System Settings → Privacy & Security → Automation.
+
+The session cards work immediately. The task side (the **In flight** strip,
+the projects panel, the week) fills in as you add to the store:
+
+```bash
+cd ~/Projects/work                      # your workspace
+mh project add website "Website redesign" --dir website
+mh task add website "Draft the new nav" --day 2026-09-24
+mh task next website
+```
+
+`mh` finds the store by walking up from the current directory, so run it
+inside the workspace, or `export MELLONHEAD_ROOT=~/Projects/work` in your
+shell profile. The full command list is `operations/mh-reference.md` in the
+workspace, generated for your user, and `mh <group> --help`.
+
+### Dashboard only
+
+`./install.sh --no-store` sets up the session cards, todos and resume without
+the task store. Or skip the installer entirely: `python3 server.py` (3.11+)
+and open http://localhost:7433.
+
+## Configuration
+
+`install.sh` writes `~/.claude-manager/config.json`:
+
+```json
+{ "root": "/Users/alex/Projects/work", "port": 7433 }
+```
+
+Optional keys: `agent`, the Claude Code agent that "Work on this" opens
+(default `orca`, used only if `~/.claude/agents/<agent>.md` or the
+workspace's `.claude/agents/<agent>.md` exists; otherwise plain `claude`).
+
+Environment variables override the file:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MELLONHEAD_ROOT` | `root` from config, else `~/Projects/mellonhead` | the workspace |
+| `CSM_PORT` | `port` from config, else 7433 | dashboard port |
+| `CSM_STATE_DIR` | `~/.claude-manager` | dashboard state and config |
+| `CSM_AGENT` | `agent` from config, else `orca` | agent for "Work on this" |
+| `CSM_PYTHON` | first 3.11+ found | the Python every script uses |
+| `MH_CODE` | the checkout `install-mh.sh` ran from | where `mh` finds `mhcli.py` |
+
+The primary user lives in the store, not the config: change it with
+`mh init --user <id> --name <Name>`. Tasks owned by the old id move to the
+new one.
 
 ## Auto-start on login
 
-Two LaunchAgents handle this:
+`install.sh` creates two LaunchAgents:
 
-- `~/Library/LaunchAgents/com.mellonhead.claude-sessions.plist` — starts the server at login, auto-restarts if it crashes. Logs to `~/.claude-manager/server.log` and `server.err.log`.
-- `~/Library/LaunchAgents/com.mellonhead.claude-sessions-browser.plist` — one-shot at login that waits for the server to be ready, then opens the browser.
-
-**Useful commands:**
+- `~/Library/LaunchAgents/com.claude-sessions.plist` starts the server at
+  login and restarts it if it crashes. Logs go to `~/.claude-manager/server.log`
+  and `server.err.log`.
+- `~/Library/LaunchAgents/com.claude-sessions.browser.plist` waits for the
+  server at login, then opens the browser.
 
 ```bash
-# Check status
-launchctl list | grep mellonhead
+launchctl list | grep claude-sessions                      # status
+launchctl kickstart -k gui/$UID/com.claude-sessions        # restart, e.g. after git pull
+tail -f ~/.claude-manager/server.err.log                   # logs
 
-# Stop server (until next login)
-launchctl unload ~/Library/LaunchAgents/com.mellonhead.claude-sessions.plist
-
-# Start it back up
-launchctl load -w ~/Library/LaunchAgents/com.mellonhead.claude-sessions.plist
-
-# Restart server (e.g. after editing server.py)
-launchctl kickstart -k gui/$UID/com.mellonhead.claude-sessions
-
-# Tail logs
-tail -f ~/.claude-manager/server.err.log
-
-# Disable auto-start permanently
-launchctl unload -w ~/Library/LaunchAgents/com.mellonhead.claude-sessions.plist
-launchctl unload -w ~/Library/LaunchAgents/com.mellonhead.claude-sessions-browser.plist
+# Remove auto-start
+launchctl bootout gui/$UID/com.claude-sessions
+launchctl bootout gui/$UID/com.claude-sessions.browser
+rm ~/Library/LaunchAgents/com.claude-sessions*.plist
 ```
+
+## Updating
+
+```bash
+cd ~/Projects/claude-sessions && git pull
+launchctl kickstart -k gui/$UID/com.claude-sessions
+./install-mh.sh ~/Projects/work      # refreshes the mh shim and its reference
+```
+
+## Uninstalling
+
+Remove the LaunchAgents (above), the SessionStart entry pointing at
+`~/.claude-manager/load-session-todo.sh` from `~/.claude/settings.json`,
+`~/.local/bin/mh`, and `~/.claude-manager/`. The workspace is yours: its
+markdown is readable without any of this, and `mh export` writes a plain
+copy of the store.
+
+## Things that assume one particular setup
+
+The dashboard grew out of one person's workflow, and a few features still
+expect pieces that live outside this repo:
+
+- **"Work on this with Orca" / "Review with Orca"** open `claude --agent orca`
+  with prompts that call skills such as `/scope-and-start`. Without an
+  `orca` agent the buttons read "with Claude" and open plain `claude`; the
+  prompt still asks for those skills, which you will not have.
+- **Weekly priorities** come from the store's weeks (`mh plan propose`,
+  `mh plan lock`), or failing that from a hand-written `priorities.md` in
+  the workspace. The "Commitment Rules" section mentioned in the week-review
+  prompt is a convention of that workspace, not something the tool creates.
+- **Notion links** on tasks are optional ids; nothing calls Notion.
 
 ## Architecture
 
-### Single-file, zero dependencies
+### Zero dependencies
 
-The entire application is one Python file (`server.py`, ~2800 lines) using only the Python 3 standard library. No npm, no pip, no build step. The HTML, CSS, and JavaScript are embedded in the Python file as a template string.
+The dashboard is one Python file (`server.py`) using only the standard library, with the HTML, CSS and JavaScript embedded as a template string. The task store and CLI are a handful of sibling modules (`mhstore.py`, `mhcli.py`, `mhgen.py`, `mhsession.py`), also stdlib only. No npm, no pip, no build step.
 
 **Why:** Minimizes maintenance burden and deployment complexity. `python3 server.py` is all you need.
 
@@ -108,20 +214,37 @@ On each poll (every 5 seconds), the server:
 ## File structure
 
 ```
-~/Projects/claude-sessions/
-  server.py              # The entire application
-  launch.command         # Double-clickable macOS shortcut
-  README.md              # This file
+claude-sessions/                 # this repo
+  server.py              # the dashboard
+  mhstore.py             # the task store (SQLite)
+  mhcli.py               # mh, the CLI agents write through
+  mhgen.py               # regenerates task-list.md, priorities.md, the projects dashboard
+  mhsession.py           # finds the Claude conversation a write came from
+  mhmigrate.py           # one-off import of hand-written task lists into the store
+  mh                     # shell entry point, copied into the workspace by install-mh.sh
+  mh-reference.md        # generated by `mh docs`; a test keeps it in step
+  install.sh             # per-person setup
+  install-mh.sh          # (re)installs mh into a workspace
+  find-python.sh         # finds a 3.11+ python for the scripts
+  launch.command         # double-clickable start
+  hooks/load-session-todo.sh   # the SessionStart hook install.sh installs
+  dev-server.sh, refresh-dev-copy.sh, backfill_task_view.py   # maintainer only, see below
 
 ~/.claude-manager/
-  sessions.json          # Persisted state: tags, renames, priorities, task assignments
+  config.json            # workspace, port (written by install.sh)
+  sessions.json          # tags, renames, priorities, task assignments
   todos/
-    {itermId}.md         # Per-session todo list with Notion metadata
-    index.json           # Maps Claude PIDs and session IDs to iTerm session IDs
-  load-session-todo.sh   # Claude Code hook script
+    {id}.md              # per-session todo list
+    index.json           # maps Claude PIDs and session IDs to iTerm session IDs
+  load-session-todo.sh   # the installed hook
 
-~/Desktop/
-  Claude Sessions.command  # Symlink to launch.command
+<workspace>/
+  priorities.md          # generated from the store's weeks
+  <project>/task-list.md # generated task tables; prose around them is yours
+  operations/
+    tasks.db             # the store
+    tasks-audit.log      # every write, one JSON line each
+    mh, mh-reference.md  # installed by install-mh.sh
 ```
 
 ## Session states
@@ -129,7 +252,7 @@ On each poll (every 5 seconds), the server:
 | State | Color | Meaning | Detection |
 |-------|-------|---------|-----------|
 | Waiting on AI | Green (pulsing) | Claude process is actively running | CPU > 1% or process state = R |
-| MQ has next step | Blue | Claude is idle, task not blocked | Default when idle |
+| *Name* has next step | Blue | Claude is idle, task not blocked | Default when idle |
 | Needs review | Orange | You need to do offline work before prompting again | Manual toggle (circle icon on card) |
 | Blocked | Grey | Waiting on someone else | Task status is "On hold" or "Blocked" in task-list.md |
 | Inactive | Grey, dashed border | Conversation exists on disk but no live tab | No matching iTerm session for the Claude session UUID |
@@ -183,13 +306,13 @@ who they block, and derives dispatch-readiness rather than storing it.
 
 ## Weekly priorities
 
-The priorities bar at the top reads from `~/Projects/mellonhead/priorities.md`. It shows day-by-day goals with clickable checkboxes. Completed days are hidden automatically. Checking an item updates the markdown file and appends the completion date.
+The priorities bar at the top reads from `priorities.md` in the workspace. It shows day-by-day goals with clickable checkboxes. Completed days are hidden automatically. Checking an item updates the markdown file and appends the completion date.
 
 The "Map to sessions" button runs fuzzy keyword matching (or exact Notion ID matching) to auto-assign Today/This Week priorities to sessions.
 
 ## Claude Code integration
 
-A `SessionStart` hook (`~/.claude-manager/load-session-todo.sh`) runs when a new Claude Code conversation starts. It:
+A `SessionStart` hook (`hooks/load-session-todo.sh`, installed to `~/.claude-manager/` by `install.sh`) runs when a new Claude Code conversation starts. It:
 
 1. Finds the Claude process PID
 2. Looks up the iTerm session ID via `~/.claude-manager/todos/index.json`
@@ -228,3 +351,20 @@ This means Claude knows what steps have been done and what's next when you resum
 | POST | `/api/question/accept` | Answer a question with its proposed answer |
 | POST | `/api/task/link` | Link a conversation to a store task; records a `link` event |
 | POST | `/api/task/orca` | Resume the conversation that last touched the task, or open Orca on it |
+
+## Maintainer notes
+
+These describe the original deployment and are not needed to run the tool.
+
+- The original install predates `install.sh` and uses the LaunchAgent labels
+  `com.mellonhead.claude-sessions` and `com.mellonhead.claude-sessions-browser`,
+  running straight from the main checkout. `install.sh` sees them and does not
+  add a second server.
+- `dev-server.sh` serves a checkout on 7434 against `~/Projects/mellonhead-dev`,
+  a git-less text copy of the live workspace that `refresh-dev-copy.sh` builds.
+  Use it with a worktree and `MH_CODE=<worktree>` so unmerged code never opens
+  the live store: opening a store migrates its schema.
+- A store with no `primary_user` setting is MQ's: it reads as `mq` / "MQ",
+  with "Mariena" folding to `mq`. `mh init --user` sets it explicitly.
+- Tests: `python3 -m unittest discover -s tests`. After changing any `mh`
+  verb, regenerate the reference with `env -u MELLONHEAD_ROOT python3 mhcli.py docs > mh-reference.md`.

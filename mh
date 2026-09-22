@@ -37,13 +37,33 @@ elif [[ " $* " != *" --repo "* ]]; then
     exit 2
 fi
 
+# Self-contained on purpose: this file is copied into the content repo, so it
+# cannot source anything from the checkout it is looking for.
+PYTHON=""
+for py in "${CSM_PYTHON:-}" /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+          "$(command -v python3 2>/dev/null)"; do
+    [ -n "$py" ] && [ -x "$py" ] || continue
+    "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
+        && { PYTHON="$py"; break; }
+done
+if [ -z "$PYTHON" ]; then
+    echo "mh: needs Python 3.11 or newer. Install one (brew install python)" >&2
+    echo "    or point \$CSM_PYTHON at it." >&2
+    exit 127
+fi
+
+# install-mh.sh writes the checkout it was run from into the line below, so a
+# clone anywhere works without MH_CODE. In the checkout itself it stays a
+# placeholder and the fallbacks apply.
+INSTALLED_FROM="@MH_CODE@"
+
 for candidate in \
     "${MH_CODE:-}" \
-    "$HOME/Projects/claude-sessions" \
-    "$HOME/Projects/claude-sessions-phase2"
+    "$INSTALLED_FROM" \
+    "$HOME/Projects/claude-sessions"
 do
     [ -n "$candidate" ] && [ -f "$candidate/mhcli.py" ] && {
-        exec /opt/homebrew/bin/python3 "$candidate/mhcli.py" "$@"
+        exec "$PYTHON" "$candidate/mhcli.py" "$@"
     }
 done
 

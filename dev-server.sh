@@ -32,4 +32,6 @@ export CSM_CWD_ALIAS="${CSM_CWD_ALIAS:-$HOME/Projects/mellonhead:$MELLONHEAD_ROO
 
 mkdir -p "$CSM_STATE_DIR"
 cd "$(dirname "$0")"
-exec /opt/homebrew/bin/python3 server.py --port "$PORT"
+. ./find-python.sh
+find_python || { echo "needs Python 3.11 or newer" >&2; exit 1; }
+exec "$PYTHON" server.py --port "$PORT"

@@ -86,8 +86,16 @@ def normalize_task_status(value):
     return text if text in TASK_STATUSES else None
 
 
-# Owner is written as "MQ" in the markdown; the plan's enum is lower case.
-_OWNER_ALIASES = {"mq": "mq", "mariena": "mq", "": "mq"}
+# The primary user: whose store this is, and who owns a row nobody else was
+# given. Set per repo by `mh init --user`, kept in settings. A store that
+# predates the setting is MQ's, so these are the fallbacks, not a default a
+# new install should inherit.
+LEGACY_PRIMARY_USER = "mq"
+LEGACY_PRIMARY_NAME = "MQ"
+LEGACY_OWNER_ALIASES = ("mariena",)
+
+# Lower case, no spaces: it is typed as `--owner <user>` and `--actor <user>`.
+_USER_ID = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 # Reserved project for work that belongs to no project.
 ONE_OFF = "one-off"
@@ -97,7 +105,9 @@ DEFAULT_SETTINGS = {
     "max_deep_per_week": "3",
     "business_days": '["Tue","Thu"]',
     "max_aba_days": "3",
-    "slack_channel": "C0BJ6FFH3QQ",
+    # Read by the content repo's automation. Empty until someone sets it; a
+    # new store must not inherit another workspace's channel.
+    "slack_channel": "",
 }
 
 
@@ -377,10 +387,25 @@ def clean(value):
     return None if text.lower() in _NULL_SENTINELS else text or None
 
 
-def normalize_owner(value):
-    """'MQ' / '' / 'Mariena' -> 'mq'. Anything else lower-cased."""
+def normalize_owner(value, primary=LEGACY_PRIMARY_USER,
+                    aliases=LEGACY_OWNER_ALIASES):
+    """
+    The primary user's id, any alias of it, or blank -> the id. Anything
+    else lower-cased. Store.normalize_owner passes the repo's own user.
+    """
     text = (clean(value) or "").lower()
-    return _OWNER_ALIASES.get(text, text or "mq")
+    if not text or text == primary or text in aliases:
+        return primary
+    return text
+
+
+def check_user_id(value):
+    """A user id as `mh init --user` accepts it, or StoreError."""
+    user = (value or "").strip().lower()
+    if not _USER_ID.match(user):
+        raise StoreError(f"bad user id {value!r}: lower case letters, digits, "
+                         f"- or _, starting with a letter")
+    return user
 
 
 def normalize_project_status(value):
@@ -744,16 +769,17 @@ class Store:
 
     def next_task(self, project_key):
         """
-        The project's next action: lowest open seq owned by mq, skipping
+        The project's next action: lowest open seq owned by the primary
+        user, skipping
         anything still blocked by depends_on. Falls back to the migrated
         is_next flag while seq is unpopulated.
         """
         rows = self.conn.execute(
             f"""SELECT * FROM tasks
-                WHERE project_key = ? AND owner = 'mq'
+                WHERE project_key = ? AND owner = ?
                   AND status IN ({','.join('?' * len(OPEN_STATUSES))})
                 ORDER BY is_next DESC, seq IS NULL, seq, id""",
-            (project_key, *OPEN_STATUSES)).fetchall()
+            (project_key, self.primary_user, *OPEN_STATUSES)).fetchall()
         for row in rows:
             dep = row["depends_on"]
             if dep:
@@ -785,7 +811,8 @@ class Store:
                 notion_project_id, goal, created_at, updated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (key, name, fields.get("dir"), fields.get("status", "active"),
-             fields.get("owner", "mq"), fields.get("due"), milestones,
+             self.normalize_owner(fields.get("owner")), fields.get("due"),
+             milestones,
              fields.get("notion_project_id"), fields.get("goal"), now, now))
         self._audit(actor, "project.add", None, None, {"key": key, "name": name})
         self._commit_if_top()
@@ -850,7 +877,7 @@ class Store:
             "status_raw": fields.get("status_raw"),
             # Folded on write: the store held mq 241, MQ 65 and Devi 5 before
             # this, because add --owner passed the string straight through.
-            "owner": normalize_owner(fields.get("owner", "mq")),
+            "owner": self.normalize_owner(fields.get("owner")),
             "seq": fields.get("seq"),
             "is_next": 1 if fields.get("is_next") else 0,
             "section": fields.get("section"),
@@ -899,7 +926,7 @@ class Store:
         if fields.get("depends_on") == task_id:
             raise StoreError("a task cannot depend on itself")
         if "owner" in fields:
-            fields["owner"] = normalize_owner(fields["owner"])
+            fields["owner"] = self.normalize_owner(fields["owner"])
         if not fields:
             return before
 
@@ -1378,6 +1405,67 @@ class Store:
             info["linked"] = info["session_id"] in linked
         return result
 
+    # -- the primary user --------------------------------------------------
+
+    @property
+    def primary_user(self):
+        return self.setting("primary_user") or LEGACY_PRIMARY_USER
+
+    @property
+    def primary_name(self):
+        name = self.setting("primary_user_name")
+        if name:
+            return name
+        user = self.primary_user
+        return LEGACY_PRIMARY_NAME if user == LEGACY_PRIMARY_USER else user.title()
+
+    def owner_aliases(self):
+        raw = self.setting("primary_user_aliases")
+        if raw is None:
+            return (list(LEGACY_OWNER_ALIASES)
+                    if self.primary_user == LEGACY_PRIMARY_USER else [])
+        return [a.lower() for a in json.loads(raw)]
+
+    def normalize_owner(self, value):
+        return normalize_owner(value, self.primary_user, self.owner_aliases())
+
+    def owner_text(self, owner):
+        """How an owner reads in generated markdown and on the dashboard."""
+        if not owner or owner == self.primary_user:
+            return self.primary_name
+        return owner.title()
+
+    def set_primary_user(self, user, name=None, aliases=(), actor="system"):
+        """
+        Name the person this store belongs to. Rows the previous primary user
+        owned move with it, so renaming never strands work under an id that
+        no longer means "me".
+        """
+        user = check_user_id(user)
+        # Shown on the dashboard and written into markdown tables: printable,
+        # one line, no table pipe, and short.
+        name = re.sub(r"[\x00-\x1f\x7f|<>\"'`]+", "", name or "").strip()[:40] \
+            or user.title()
+        aliases = sorted({a.strip().lower() for a in aliases
+                          if a and a.strip() and a.strip().lower() != user})
+        before = self.primary_user
+        with self.write():
+            if before != user:
+                moved = 0
+                for table in ("tasks", "projects"):
+                    moved += self.conn.execute(
+                        f"UPDATE {table} SET owner = ? WHERE owner = ?",
+                        (user, before)).rowcount
+                self._audit(actor, "setting.set", None, {"owner": before},
+                            {"owner": user}, kind="setting",
+                            summary=f"{moved} rows owned by {before} "
+                                    f"now owned by {user}")
+            self.set_setting("primary_user", user, actor=actor)
+            self.set_setting("primary_user_name", name, actor=actor)
+            self.set_setting("primary_user_aliases",
+                             json.dumps(aliases), actor=actor)
+        return user
+
     # -- settings ----------------------------------------------------------
 
     def set_setting(self, key, value, actor="system"):
@@ -1446,12 +1534,15 @@ class Store:
 # Opening
 # ---------------------------------------------------------------------------
 
-def open_store(root=None, db_path=None, seed_settings=True):
+def open_store(root=None, db_path=None, seed_settings=True,
+               primary_user=None):
     """
     Open (creating if needed) the store for a content repo.
 
     root      the repo, default $MELLONHEAD_ROOT or ~/Projects/mellonhead
     db_path   override the db location; ':memory:' for tests
+    primary_user  for a new store, whose it is; before the one-off project
+              is seeded, so that row is theirs rather than MQ's
     """
     import os
 
@@ -1485,6 +1576,9 @@ def open_store(root=None, db_path=None, seed_settings=True):
 
     store = Store(conn, root)
     migrate_schema(store)
+    if primary_user and not store.setting("primary_user"):
+        conn.execute("INSERT INTO settings (key, value) VALUES (?,?)",
+                     ("primary_user", check_user_id(primary_user)))
     if seed_settings:
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute(
@@ -1496,7 +1590,8 @@ def open_store(root=None, db_path=None, seed_settings=True):
                 """INSERT INTO projects (key, name, status, owner, milestones,
                                          created_at, updated_at)
                    VALUES (?,?,?,?,?,?,?)""",
-                (ONE_OFF, "One-off tasks", "active", "mq", "[]", now, now))
+                (ONE_OFF, "One-off tasks", "active", store.primary_user,
+                 "[]", now, now))
         conn.commit()
     return store
 

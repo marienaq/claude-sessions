@@ -57,13 +57,10 @@ STATUS_TEXT = {
     "planned": "Not started",
     "in_progress": "In progress",
     "waiting": "Waiting",
-    "review": "Ready for MQ review",
+    "review": "Ready for {name} review",
     "done": "Done",
     "canceled": "Killed",
 }
-
-OWNER_TEXT = {"mq": "MQ"}
-
 
 def atomic_write(path, text):
     """Unique temp name: two generators must not clobber each other's."""
@@ -87,16 +84,12 @@ def stamp(what):
             f"Edit tasks in the session manager, not here. -->")
 
 
-def owner_text(owner):
-    return OWNER_TEXT.get(owner, (owner or "mq").title())
-
-
-def status_text(task):
+def status_text(task, name=mhstore.LEGACY_PRIMARY_NAME):
     """Prefer the original cell so a hand-written nuance is not flattened."""
     raw = (task["status_raw"] or "").strip()
     if raw and mhstore.normalize_status(raw)[0] == task["status"]:
         return raw
-    return STATUS_TEXT.get(task["status"], task["status"])
+    return STATUS_TEXT.get(task["status"], task["status"]).format(name=name)
 
 
 def cell(value):
@@ -120,7 +113,7 @@ def render_question_inline(q):
     return line
 
 
-def render_task_row(task, repo_rel_note=True, questions=()):
+def render_task_row(store, task, repo_rel_note=True, questions=()):
     note = ""
     if task["notes"]:
         note = task["notes"]
@@ -128,7 +121,7 @@ def render_task_row(task, repo_rel_note=True, questions=()):
         link = f"[note]({Path(task['note_path']).name})" if repo_rel_note else ""
         note = f"{note} {link}".strip() if note else link
     # An open question sits with the row it gates, so a reader of the list
-    # sees what MQ still has to decide without opening the brief. Answered
+    # sees what the user still has to decide without opening the brief. Answered
     # ones do not render: the answer is in the store and the note file.
     for q in questions:
         note = f"{note} — {render_question_inline(q)}".strip(" —") if note \
@@ -136,10 +129,10 @@ def render_task_row(task, repo_rel_note=True, questions=()):
     return "| " + " | ".join(cell(x) for x in (
         task["display_ord"] or task["id"],
         task["title"],
-        status_text(task),
+        status_text(task, store.primary_name),
         f"`{task['notion_task_id']}`" if task["notion_task_id"] else "(no Notion task)",
         note,
-        owner_text(task["owner"]),
+        store.owner_text(task["owner"]),
         task["due"] or "",
         task["seq"] if task["seq"] is not None else "",
     )) + " |"
@@ -215,7 +208,7 @@ def generate_task_list(store, repo, project_key, dry_run=False):
                     consumed.add(other)
         out.append(TASK_TABLE_HEADER)
         out.append(TASK_TABLE_DIVIDER)
-        out.extend(render_task_row(t, questions=open_questions.get(t["id"], ()))
+        out.extend(render_task_row(store, t, questions=open_questions.get(t["id"], ()))
                    for t in sorted(rows, key=sort_key))
         prev_end = end
     out.extend(lines[prev_end:])
@@ -316,8 +309,9 @@ def render_week(store, week_start):
     if proposed:
         lines.append("## Proposed (unconfirmed)")
         lines.append("")
-        lines.append("*Captured, waiting on MQ. Keep or drop in the session "
-                     "manager; nothing here is committed.*")
+        lines.append(f"*Captured, waiting on {store.primary_name}. Keep or "
+                     f"drop in the session manager; nothing here is "
+                     f"committed.*")
         lines.append("")
         lines.extend(render_day_line(t) for t in proposed)
         lines.append("")
@@ -327,8 +321,8 @@ def render_week(store, week_start):
         "AND planned_day IS NULL ORDER BY project_key, seq IS NULL, seq, id")]
     lines.append("## Backlog")
     lines.append("")
-    lines.append("*One list. Items wait here until a planning pass or MQ moves "
-                 "them onto a day card.*")
+    lines.append(f"*One list. Items wait here until a planning pass or "
+                 f"{store.primary_name} moves them onto a day card.*")
     lines.append("")
     lines.extend(render_day_line(t) for t in backlog)
     lines.append("")

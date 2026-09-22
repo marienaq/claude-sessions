@@ -491,3 +491,59 @@ class TestFrontEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRequestGate(TaskViewCase):
+    """
+    Any web page can send a simple POST to localhost, and a DNS-rebound name
+    can read the replies. Only the dashboard's own page may do either.
+    """
+
+    def raw(self, path, method="GET", body=None, headers=None):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", method=method,
+            data=body.encode() if body is not None else None,
+            headers=headers or {})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_own_page_allowed(self):
+        self.assertEqual(self.raw("/api/tasks"), 200)
+        self.assertEqual(self.raw("/api/tasks", headers={
+            "Host": f"localhost:{self.port}"}), 200)
+
+    def test_foreign_host_refused(self):
+        self.assertEqual(self.raw("/api/tasks", headers={
+            "Host": f"attacker.example:{self.port}"}), 403)
+
+    def test_text_plain_post_refused(self):
+        body = json.dumps({"taskFile": str(self.repo / "victim"), "title": "x"})
+        self.assertEqual(self.raw("/api/create-task", "POST", body,
+                                  {"Content-Type": "text/plain"}), 403)
+
+    def test_foreign_origin_refused(self):
+        self.assertEqual(self.raw("/api/tag", "POST", "{}", {
+            "Content-Type": "application/json",
+            "Origin": "https://evil.example"}), 403)
+        self.assertNotEqual(self.raw("/api/tag", "POST", "{}", {
+            "Content-Type": "application/json",
+            "Origin": f"http://localhost:{self.port}"}), 403)
+
+    def test_markdown_endpoints_only_touch_task_lists(self):
+        victim = self.repo / "victim.rc"
+        victim.write_text("export FOO=1\n")
+        status, _ = self.post("/api/create-task", {
+            "taskFile": str(victim), "title": "x\ntouch /tmp/pwned #"})
+        self.assertEqual(status, 404)
+        self.assertEqual(victim.read_text(), "export FOO=1\n")
+
+        legacy = self.repo / "legacy" / "task-list.md"
+        legacy.parent.mkdir()
+        legacy.write_text("| # | Task | Status |\n|---|---|---|\n| 1 | a | Not started |\n")
+        status, _ = self.post("/api/create-task", {
+            "taskFile": str(legacy), "title": "two\nlines | here"})
+        self.assertEqual(status, 200)
+        self.assertIn("| 2 | two lines here |", legacy.read_text())

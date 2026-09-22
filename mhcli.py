@@ -26,6 +26,7 @@ Workstream 2.5. Stdlib only.
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import date, datetime
@@ -103,10 +104,10 @@ def tag(task):
     return f"#{task['id']}"
 
 
-def show(task, prefix=""):
+def show(store, task, prefix=""):
     bits = [f"{prefix}{tag(task):<22} {task['status']:<11} {task['title'][:56]}"]
     extra = []
-    if task["owner"] != "mq":
+    if task["owner"] != store.primary_user:
         extra.append(f"owner={task['owner']}")
     if task["due"]:
         extra.append(f"due={task['due']}")
@@ -208,7 +209,7 @@ def cmd_task_next(store, repo, args):
         for project, task in rows:
             flag = "" if project["status"] == "active" else f"  ({project['status']})"
             print(f"{project['key']:<18}{flag}")
-            print(show(task, prefix="  "))
+            print(show(store, task, prefix="  "))
         return 0
 
     if not args.project:
@@ -217,7 +218,7 @@ def cmd_task_next(store, repo, args):
     if not task:
         print(f"{args.project}: nothing open")
         return 0
-    print(show(task))
+    print(show(store, task))
     ready = show_readiness(store, task)
     if ready:
         print(ready)
@@ -243,7 +244,7 @@ def cmd_task_find(store, repo, args):
         print("no matching task")
         return 1
     for _, _, task in scored[:args.limit]:
-        print(show(task))
+        print(show(store, task))
     return 0
 
 
@@ -257,8 +258,8 @@ def cmd_task_add(store, repo, args):
         confirmed=0 if args.unconfirmed else 1,
         status="planned" if args.day else "backlog",
         planned_day=args.day, load=args.load, due=args.due,
-        owner=args.owner or "mq", notes=args.note)
-    print(show(task))
+        owner=args.owner, notes=args.note)
+    print(show(store, task))
     if not args.no_regen:
         regenerate(store, repo, [project])
     return 0
@@ -267,14 +268,14 @@ def cmd_task_add(store, repo, args):
 def cmd_task_done(store, repo, args):
     task = resolve(store, args.task)
     if task["status"] == "done":
-        print(f"already done: {show(task)}")
+        print(f"already done: {show(store, task)}")
         return 0
     store.complete_task(task["id"], actor=args.actor)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     nxt = store.next_task(task["project_key"])
     if nxt:
         print(f"\nnext in {task['project_key']}:")
-        print(show(nxt, prefix="  "))
+        print(show(store, nxt, prefix="  "))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -291,7 +292,7 @@ def cmd_task_status(store, repo, args):
     if args.status != "waiting" and task["waiting_on"] and args.waiting_on is None:
         fields["waiting_on"] = None
     store.update_task(task["id"], actor=args.actor, **fields)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -342,7 +343,7 @@ def cmd_task_plan(store, repo, args):
         store.plan_task(task["id"], args.day, actor=args.actor)
     else:
         store.unplan_task(task["id"], actor=args.actor)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -352,7 +353,7 @@ def cmd_task_load(store, repo, args):
     task = resolve(store, args.task)
     store.update_task(task["id"], actor=args.actor,
                       load=None if args.load == "none" else args.load)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -417,7 +418,7 @@ def cmd_task_set(store, repo, args):
     if not fields:
         raise CliError("nothing to set; see `mh task set --help`")
     store.update_task(task["id"], actor=args.actor, **fields)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -433,18 +434,19 @@ def cmd_task_owner(store, repo, args):
     Hand a task to someone, or take it back.
 
     Owner is who does the work, not who is waiting: a row owned by Anushka
-    stays off MQ's next-action list (next_task only returns mq rows) and
-    renders under her name in the task list. "MQ" and "Mariena" fold to mq.
+    stays off the primary user's next-action list (next_task only returns
+    their rows) and renders under her name in the task list. The primary
+    user's aliases fold to their id.
     """
     task = resolve(store, args.task)
-    owner = mhstore.normalize_owner(args.owner)
+    owner = store.normalize_owner(args.owner)
     if not owner:
         raise CliError("owner needs a name")
     if task["owner"] == owner:
-        print(f"already owned by {owner}: {show(task)}")
+        print(f"already owned by {owner}: {show(store, task)}")
         return 0
     store.update_task(task["id"], actor=args.actor, owner=owner)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -453,7 +455,7 @@ def cmd_task_owner(store, repo, args):
 def cmd_task_seq(store, repo, args):
     task = resolve(store, args.task)
     store.update_task(task["id"], actor=args.actor, seq=args.seq, is_next=0)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -462,7 +464,7 @@ def cmd_task_seq(store, repo, args):
 def cmd_task_confirm(store, repo, args):
     task = resolve(store, args.task)
     store.confirm_task(task["id"], actor=args.actor)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
     return 0
@@ -479,7 +481,7 @@ def cmd_task_brief(store, repo, args):
     if not (repo / rel).is_file():
         raise CliError(f"no such file under the repo: {rel}")
     store.update_task(task["id"], actor=args.actor, brief_path=rel)
-    print(show(store.task(task["id"])))
+    print(show(store, store.task(task["id"])))
     print(show_readiness(store, store.task(task["id"])))
     if not args.no_regen:
         regenerate(store, repo, [task["project_key"]])
@@ -729,7 +731,7 @@ def cmd_task_list(store, repo, args):
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0
     for task in rows:
-        print(show(task))
+        print(show(store, task))
         ready = show_readiness(store, task)
         if ready:
             print(ready)
@@ -804,13 +806,23 @@ def cmd_project_add(store, repo, args):
     project = store.add_project(
         args.key, args.name, actor=args.actor, dir=args.dir,
         status=mhstore.normalize_project_status(args.status),
-        owner=args.owner or "mq", due=args.due,
+        owner=args.owner, due=args.due,
         notion_project_id=args.notion, goal=args.goal)
     print(f"{project['key']:<18} {project['status']:<9} {project['name']}")
     if project["dir"]:
         print(f"  dir: {project['dir']}")
-        print("  add a row to operations/project-registry.md so the migration "
-              "and the dashboard see it too.")
+        # The generator only rewrites tables it finds, so a project with no
+        # list would never get one. Seed an empty table here, the one place
+        # that knows the project is new, never on a regen.
+        task_list = repo / project["dir"] / "task-list.md"
+        if not task_list.exists():
+            mhgen.atomic_write(task_list, "\n".join((
+                f"# {project['name']}", "", "## Tasks", "",
+                mhgen.TASK_TABLE_HEADER, mhgen.TASK_TABLE_DIVIDER, "")))
+            print(f"  created {project['dir']}/task-list.md")
+        if (repo / "operations" / "project-registry.md").exists():
+            print("  add a row to operations/project-registry.md so the "
+                  "migration sees it too.")
     return 0
 
 
@@ -840,7 +852,7 @@ def cmd_project_set(store, repo, args):
     if args.goal is not None:
         fields["goal"] = _blank_is_none(args.goal)
     if args.owner is not None:
-        fields["owner"] = mhstore.normalize_owner(args.owner)
+        fields["owner"] = store.normalize_owner(args.owner)
     if args.notion is not None:
         fields["notion_project_id"] = _blank_is_none(args.notion)
     if not fields:
@@ -954,7 +966,7 @@ def cmd_export(store, repo, args):
         for task in rows:
             mark = "x" if task["status"] == "done" else " "
             bits = [f"- [{mark}] {task['title']}"]
-            if task["owner"] != "mq":
+            if task["owner"] != store.primary_user:
                 bits.append(f"({task['owner']})")
             if task["due"]:
                 bits.append(f"due {task['due']}")
@@ -984,14 +996,62 @@ def cmd_docs(store, repo, args):
     return 0
 
 
-def render_reference():
+def cmd_init(repo, args):
+    """
+    Create an empty store, or rename the primary user of an existing one.
+
+    The only verb that may create tasks.db. Everything else refuses without
+    one, so a mistyped MELLONHEAD_ROOT cannot conjure an empty store.
+    """
+    db = repo / "operations" / "tasks.db"
+    fresh = not db.exists()
+    if not fresh and not args.user:
+        raise CliError(f"a store already exists at {db}; pass --user to "
+                       f"rename its primary user")
+    user = mhstore.check_user_id(args.user or os.environ.get("USER", ""))
+    store = mhstore.open_store(root=repo, primary_user=user)
+    try:
+        store.set_primary_user(user, name=args.name, aliases=args.alias or (),
+                               actor=args.actor if args.actor != "agent"
+                               else user)
+        if not args.no_regen:
+            mhgen.generate_all(store, repo)
+        verb = "created" if fresh else "updated"
+        print(f"{verb} {db}")
+        print(f"  primary user: {store.primary_user} "
+              f"(shown as {store.primary_name})")
+        if store.owner_aliases():
+            print(f"  also folds:   {', '.join(store.owner_aliases())}")
+        if fresh:
+            print("next: mh project add <key> \"<name>\" --repo "
+                  f"{repo}")
+    finally:
+        store.close()
+    return 0
+
+
+def render_reference(user=mhstore.LEGACY_PRIMARY_USER,
+                     name=mhstore.LEGACY_PRIMARY_NAME):
     """
     The command table, built from the parser itself.
 
     Hand-written docs drift from the code and nobody notices until an agent
     runs a command that no longer exists. This is generated, and a test
     asserts the committed file still matches.
+
+    The prose is written about MQ, whose store this started as. For any
+    other primary user the names are swapped on the way out, so an agent in
+    someone else's repo is told whose questions it is asking.
     """
+    text = _render_reference()
+    if (user, name) == (mhstore.LEGACY_PRIMARY_USER,
+                        mhstore.LEGACY_PRIMARY_NAME):
+        return text
+    text = re.sub(r"\bMQ\b", name, text)
+    return re.sub(r"\bmq\b", user, text)
+
+
+def _render_reference():
     parser = build_parser()
     lines = [HEADER.strip(), "", "## Commands", ""]
 
@@ -1482,6 +1542,13 @@ def build_parser():
     p = sub.add_parser("export", help="a readable copy that needs no SQLite", parents=[common])
     p.set_defaults(fn=cmd_export, group="export", action=None)
 
+    p = sub.add_parser("init", help="create an empty store, or rename its primary user", parents=[common])
+    p.add_argument("--user", help="the primary user's id: lower case, no spaces (default $USER)")
+    p.add_argument("--name", help="how the user is shown in markdown and on the dashboard")
+    p.add_argument("--alias", action="append",
+                   help="another spelling that folds to --user as an owner; repeatable")
+    p.set_defaults(fn=cmd_init, group="init", action=None)
+
     p = sub.add_parser("docs", help="print this command reference as markdown", parents=[common])
     p.set_defaults(fn=cmd_docs, group="docs", action=None)
 
@@ -1502,7 +1569,7 @@ def main(argv=None):
     # The reference must be readable before anything is set up, so it runs
     # before any check on the repo.
     if args.group == "docs":
-        print(render_reference())
+        print(render_reference(*_reference_user(args)))
         return 0
 
     if args.group == "check-skills":
@@ -1514,6 +1581,12 @@ def main(argv=None):
     repo = args.repo or os.environ.get(
         "MELLONHEAD_ROOT", Path.home() / "Projects" / "mellonhead")
     repo = Path(repo).expanduser()
+    if args.group == "init":
+        try:
+            return cmd_init(repo, args)
+        except (CliError, StoreError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     if not (repo / "operations").exists():
         print(f"no content repo at {repo}", file=sys.stderr)
         return 2
@@ -1524,8 +1597,8 @@ def main(argv=None):
     # nothing. Refuse instead, and say where it looked.
     if not (repo / "operations" / "tasks.db").exists():
         print(f"no task store at {repo}/operations/tasks.db\n"
-              f"Set MELLONHEAD_ROOT or pass --repo. To create one, run the "
-              f"migration.", file=sys.stderr)
+              f"Set MELLONHEAD_ROOT or pass --repo. To create one, run "
+              f"`mh init --repo {repo} --user <you>`.", file=sys.stderr)
         return 2
 
     store = mhstore.open_store(root=repo, seed_settings=False)
@@ -1536,6 +1609,20 @@ def main(argv=None):
         return 1
     finally:
         store.close()
+
+
+def _reference_user(args):
+    """The repo's primary user, when there is a store to ask; else MQ's."""
+    import os
+    repo = args.repo or os.environ.get("MELLONHEAD_ROOT")
+    if repo and (Path(repo).expanduser() / "operations" / "tasks.db").exists():
+        store = mhstore.open_store(root=Path(repo).expanduser(),
+                                   seed_settings=False)
+        try:
+            return store.primary_user, store.primary_name
+        finally:
+            store.close()
+    return mhstore.LEGACY_PRIMARY_USER, mhstore.LEGACY_PRIMARY_NAME
 
 
 if __name__ == "__main__":

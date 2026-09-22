@@ -29,13 +29,30 @@ except ImportError:                     # store not installed; markdown only
 #   MELLONHEAD_ROOT  the content repo to read (priorities.md, task lists, store)
 #   CSM_STATE_DIR    session-manager state (sessions.json, todos/)
 #   CSM_PORT         listen port; --port on the command line wins
-PORT = int(os.environ.get("CSM_PORT", "7433"))
-MELLONHEAD_ROOT = Path(
-    os.environ.get("MELLONHEAD_ROOT", Path.home() / "Projects" / "mellonhead")
-).expanduser()
+# An environment variable wins over <state dir>/config.json, which install.sh
+# writes, so the LaunchAgent, launch.command and a bare `python3 server.py`
+# all agree on the workspace without each carrying it.
 STATE_DIR = Path(
     os.environ.get("CSM_STATE_DIR", Path.home() / ".claude-manager")
 ).expanduser()
+
+
+def _load_config():
+    try:
+        return json.loads((STATE_DIR / "config.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+CONFIG = _load_config()
+PORT = int(os.environ.get("CSM_PORT") or CONFIG.get("port") or 7433)
+MELLONHEAD_ROOT = Path(
+    os.environ.get("MELLONHEAD_ROOT") or CONFIG.get("root")
+    or Path.home() / "Projects" / "mellonhead"
+).expanduser()
+# The agent the task popup's "Work on this" button opens. Only used when a
+# definition for it exists; otherwise plain `claude`.
+TASK_AGENT = os.environ.get("CSM_AGENT") or CONFIG.get("agent") or "orca"
 
 SESSIONS_FILE = STATE_DIR / "sessions.json"
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
@@ -1795,6 +1812,58 @@ def week_review_prompt(store, week_start, resuming=False):
     return "\n".join(lines)
 
 
+def agent_available(name, cwd=None):
+    """
+    Whether `claude --agent <name>` would find a definition. Checked rather
+    than assumed: on a machine without it, claude exits on the flag and the
+    button opens a tab that closes before anyone reads why.
+    """
+    if not name:
+        return False
+    places = [Path.home() / ".claude" / "agents", MELLONHEAD_ROOT / ".claude" / "agents"]
+    if cwd:
+        places.append(Path(cwd) / ".claude" / "agents")
+    return any((d / f"{name}.md").exists() for d in places)
+
+
+def markdown_task_file(raw):
+    """
+    A task-list.md the legacy markdown endpoints may read or write, or None.
+
+    These take a path from the request body. Anything but a file named
+    task-list.md is refused, so a request cannot point them at a shell
+    profile or a key file.
+    """
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if path.name != "task-list.md" or not path.is_file():
+        return None
+    return path
+
+
+def table_cell(text):
+    """One markdown table cell: no row break, no column break."""
+    return re.sub(r"\s*[\r\n|]+\s*", " ", text).strip()
+
+
+def primary_user():
+    """(id, display name) of whoever the store belongs to."""
+    store = get_store() if mhstore else None
+    if store is not None:
+        return store.primary_user, store.primary_name
+    if mhstore:
+        return mhstore.LEGACY_PRIMARY_USER, mhstore.LEGACY_PRIMARY_NAME
+    return "mq", "MQ"
+
+
+def me():
+    return primary_user()[0]
+
+
 def launch_claude_session(cwd, prompt, resume_id=None, agent=None,
                           prompt_name="week-review-prompt.md"):
     """
@@ -1810,6 +1879,8 @@ def launch_claude_session(cwd, prompt, resume_id=None, agent=None,
 
     safe_cwd = shlex.quote(cwd)
     safe_prompt = shlex.quote(str(prompt_file))
+    if agent and not agent_available(agent, cwd):
+        agent = None
     flags = f" --agent {shlex.quote(agent)}" if agent else ""
     if resume_id:
         command = (f"cd {safe_cwd} && claude{flags} --resume {shlex.quote(resume_id)} "
@@ -2178,12 +2249,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass  # Suppress default logging
 
     def do_GET(self):
+        if not self.request_allowed():
+            return
         with _HANDLER_LOCK:
             self._do_GET()
 
     def do_POST(self):
+        if not self.request_allowed():
+            return
         with _HANDLER_LOCK:
             self._do_POST()
+
+    def request_allowed(self):
+        """
+        Refuse anything that did not come from the dashboard's own page.
+
+        Listening on 127.0.0.1 is not enough. Any web page can POST to
+        localhost: a text/plain body is a "simple" request with no preflight,
+        and read_body parses it as JSON regardless, so a page on any site
+        could append lines to a file of its choosing through create-task.
+        And a DNS-rebound hostname lets a page read the responses.
+
+        Host must name loopback (defeats rebinding). A POST must be JSON,
+        which a cross-site page cannot send without a preflight this server
+        never answers, and must carry our own Origin if it carries one.
+        """
+        port = self.server.server_address[1]
+        allowed = {f"{h}:{port}" for h in ("localhost", "127.0.0.1", "[::1]")}
+        host = (self.headers.get("Host") or "").strip().lower()
+        ok = host in allowed
+        if ok and self.command == "POST":
+            origin = (self.headers.get("Origin") or "").strip().lower()
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0]
+            ok = (ctype.strip().lower() == "application/json"
+                  and (not origin or origin in {f"http://{a}" for a in allowed}))
+        if not ok:
+            self.send_error(403)
+        return ok
 
     def not_found(self):
         # send_error carries a Content-Length; a bare 404 without one leaves
@@ -2218,6 +2320,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "priorities": parse_priorities(),
                 "panels": load_panels(),
                 "colorGroups": store.get("color_groups", {}),
+                "user": dict(zip(("id", "name"), primary_user()),
+                             agent=(TASK_AGENT.title()
+                                    if agent_available(TASK_AGENT) else None)),
             })
         elif self.path == "/api/task-files":
             files = []
@@ -2382,9 +2487,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "No such task"}, 404)
                     return
                 if done:
-                    store.complete_task(task["id"], actor="mq")
+                    store.complete_task(task["id"], actor=me())
                 else:
-                    store.reopen_task(task["id"], actor="mq",
+                    store.reopen_task(task["id"], actor=me(),
                                       status="planned" if task["planned_day"]
                                       else "backlog")
                 regenerate_views([task["project_key"]])
@@ -2432,11 +2537,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             try:
                 if self.path.endswith("/accept"):
-                    q = store.answer_question(qid, actor="mq", accept=True,
+                    q = store.answer_question(qid, actor=me(), accept=True,
                                               source="dashboard")
                 else:
                     q = store.answer_question(qid, (body.get("answer") or "").strip(),
-                                              actor="mq", source="dashboard")
+                                              actor=me(), source="dashboard")
             except mhstore.StoreError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 400)
                 return
@@ -2486,7 +2591,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              if (s.get("claudeSessionId") or s.get("itermId")) == key), None)
             sid = key if len(key) == 36 and key.count("-") == 4 else None
             try:
-                store.link_session(task["id"], actor="mq", session_id=sid,
+                store.link_session(task["id"], actor=me(), session_id=sid,
                                    iterm_id=iterm_id or body.get("itermId"))
             except mhstore.StoreError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 400)
@@ -2517,7 +2622,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sid = key if len(key) == 36 and key.count("-") == 4 else None
             if store is not None and sid and store.task(task_id):
                 try:
-                    store.unlink_session(task_id, actor="mq", session_id=sid)
+                    store.unlink_session(task_id, actor=me(), session_id=sid)
                 except mhstore.StoreError as exc:
                     print(f"unlink event failed: {exc}")
             self.send_json({"ok": True, "remaining": len(remaining)})
@@ -2574,7 +2679,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         "error": f"No project {project_key}"}, 404)
                         return
                     task = store.add_task(
-                        project_key, title, actor="mq", source="manual",
+                        project_key, title, actor=me(), source="manual",
                         status="planned" if body.get("plannedDay") else "backlog",
                         planned_day=body.get("plannedDay"),
                         load=body.get("load"), due=body.get("due"))
@@ -2588,7 +2693,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not week_start:
                         self.send_json({"ok": False, "error": "No week"}, 400)
                         return
-                    store.lock_week(week_start, actor="mq")
+                    store.lock_week(week_start, actor=me())
                     regenerate_views(
                         {t["project_key"] for t in store.tasks() if t["planned_day"]})
                     self.send_json({"ok": True, "weekStart": week_start})
@@ -2602,23 +2707,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if action == "plan":
                     day = body.get("day")
                     if day:
-                        store.plan_task(task["id"], day, actor="mq")
+                        store.plan_task(task["id"], day, actor=me())
                     else:
-                        store.unplan_task(task["id"], actor="mq")
+                        store.unplan_task(task["id"], actor=me())
                 elif action == "done":
-                    store.complete_task(task["id"], actor="mq")
+                    store.complete_task(task["id"], actor=me())
                 elif action == "reopen":
                     store.reopen_task(
-                        task["id"], actor="mq",
+                        task["id"], actor=me(),
                         status="planned" if task["planned_day"] else "backlog")
                 elif action == "confirm":
-                    store.confirm_task(task["id"], actor="mq")
+                    store.confirm_task(task["id"], actor=me())
                 elif action == "dismiss":
                     # A proposal MQ does not want. Cancelled, not deleted:
                     # the row and its audit line stay.
-                    store.update_task(task["id"], actor="mq", status="canceled")
+                    store.update_task(task["id"], actor=me(), status="canceled")
                 elif action == "load":
-                    store.update_task(task["id"], actor="mq",
+                    store.update_task(task["id"], actor=me(),
                                       load=body.get("load") or None)
                 else:
                     self.send_json({"ok": False, "error": "Unknown action"}, 404)
@@ -2787,7 +2892,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if task is None:
                     self.send_json({"ok": False, "error": "No such task"}, 404)
                     return
-                store.complete_task(task["id"], actor="mq")
+                store.complete_task(task["id"], actor=me())
                 nxt = store.next_task(task["project_key"])
                 regenerate_views([task["project_key"]])
                 self.send_json({"ok": True, "id": task["id"],
@@ -2795,8 +2900,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
 
             if task_file and task_number:
-                expanded = str(Path(task_file).expanduser())
-                if Path(expanded).exists():
+                path = markdown_task_file(task_file)
+                try:
+                    task_number = int(task_number)
+                except (TypeError, ValueError):
+                    path = None
+                expanded = str(path) if path else ""
+                if path:
                     with open(expanded) as f:
                         content = f.read()
                     # Find the row for this task number and change status to Done
@@ -2830,7 +2940,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     project_key = project["key"] if project else None
                 if project_key and store.project(project_key):
                     task = store.add_task(
-                        project_key, title, actor="mq", source="manual",
+                        project_key, title, actor=me(), source="manual",
                         status="backlog", planned_day=body.get("plannedDay"),
                         load=body.get("load"), due=body.get("due"))
                     self.send_json({"ok": True, "id": task["id"],
@@ -2839,8 +2949,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
 
             if task_file and title:
-                expanded = str(Path(task_file).expanduser())
-                if Path(expanded).exists():
+                path = markdown_task_file(task_file)
+                expanded = str(path) if path else ""
+                title = table_cell(title)
+                if path and title:
                     with open(expanded) as f:
                         content = f.read()
                     # Find the highest task number
@@ -2883,9 +2995,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
 
             if task_file:
-                expanded = str(Path(task_file).expanduser())
-                if Path(expanded).exists():
-                    parsed = parse_task_list(Path(expanded))
+                path = markdown_task_file(task_file)
+                if path:
+                    parsed = parse_task_list(path)
                     self.send_json(parsed)
                 else:
                     self.send_json({"error": "File not found"}, 404)
@@ -2909,8 +3021,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     save_store(store)
                     self.send_json({"ok": True})
                 elif task_file:
-                    expanded = str(Path(task_file).expanduser())
-                    if Path(expanded).exists():
+                    path = markdown_task_file(task_file)
+                    expanded = str(path) if path else ""
+                    if path:
                         links[iterm_id] = expanded
                         if notion_task_id or body.get("taskId"):
                             entry = {
@@ -2944,7 +3057,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if linked is not None:
                                 sid = iterm_id if len(iterm_id) == 36 and iterm_id.count("-") == 4 else None
                                 try:
-                                    task_store.link_session(linked["id"], actor="mq",
+                                    task_store.link_session(linked["id"], actor=me(),
                                                             session_id=sid,
                                                             iterm_id=body.get("itermId", ""))
                                 except Exception as exc:      # noqa: BLE001
@@ -4122,7 +4235,7 @@ body {
     </div>
     <div class="legend">
         <span class="legend-item"><span class="legend-dot working"></span>Waiting on AI</span>
-        <span class="legend-item"><span class="legend-dot ready"></span>MQ has next step</span>
+        <span class="legend-item"><span class="legend-dot ready"></span><span id="legendReady">MQ has next step</span></span>
         <span class="legend-item"><span class="legend-dot needs_review"></span>Needs review</span>
         <span class="legend-item"><span class="legend-dot blocked"></span>Waiting on someone else</span>
     </div>
@@ -4242,6 +4355,9 @@ async function pollView() {
     if (openTaskId) fetchTask();
 }
 
+// Whose dashboard this is, from the store. Only the fallback is MQ's.
+let me = {id: 'mq', name: 'MQ', agent: 'Orca'};
+
 async function fetchSessions(force = false) {
     if (isEditing && !force) return;
     try {
@@ -4251,6 +4367,11 @@ async function fetchSessions(force = false) {
         colorGroups = data.colorGroups || {};
         priorities = data.priorities || {};
         panels = data.panels || {available: false, backlog: [], proposed: [], projects: []};
+        if (data.user) {
+            me = data.user;
+            const legend = document.getElementById('legendReady');
+            if (legend) legend.textContent = me.name + ' has next step';
+        }
 
         // The poll exists for the session cards, which really do change every
         // few seconds. The priorities bar and the panels almost never do, and
@@ -4421,7 +4542,7 @@ function renderPriorities() {
         <div class="priorities-header">
             <div class="priorities-title">${escHtml(w.title || (w.isCurrent ? 'This Week' : 'Next Week'))}${suffix}</div>
             <div class="priorities-actions">
-                ${live && w.weekStart && !w.locked ? `<button class="map-btn primary" onclick="reviewWeek('${w.weekStart}')">Review with Orca</button>` : ''}
+                ${live && w.weekStart && !w.locked ? `<button class="map-btn primary" onclick="reviewWeek('${w.weekStart}')">Review with ${escHtml(me.agent || 'Claude')}</button>` : ''}
                 ${live && w.weekStart && !w.locked ? `<button class="map-btn" onclick="lockWeek('${w.weekStart}')">Lock week</button>` : ''}
                 ${showMapBtn ? '<button class="map-btn" onclick="mapPriorities()">Map to sessions</button>' : ''}
             </div>
@@ -4545,7 +4666,7 @@ async function reviewWeek(weekStart) {
 
 async function lockWeek(weekStart) {
     if (!confirm('Lock this week? Planned rows are committed.\n\n' +
-                 'If you have not talked it through yet, "Review with Orca" ' +
+                 `If you have not talked it through yet, "Review with ${me.agent || 'Claude'}" ` +
                  'opens a session that walks you through the assumptions first.')) return;
     await storeAction('plan/lock', {weekStart});
     fetchSessions(true);
@@ -4807,7 +4928,7 @@ function renderCard(s) {
             linkHtml = `<div class="task-link-btn" onclick="event.stopPropagation();openTaskLink('${s.itermId}')">Link task list</div>`;
         }
 
-        const stateLabels = {working:'Waiting on AI',ready:'MQ has next step',needs_review:'Needs review',blocked:'Waiting on someone else',inactive:'Inactive — click to resume'};
+        const stateLabels = {working:'Waiting on AI',ready:escAttr(me.name) + ' has next step',needs_review:'Needs review',blocked:'Waiting on someone else',inactive:'Inactive — click to resume'};
         const isInactive = state === 'inactive';
         const inactiveBadge = isInactive ? `<span class="inactive-badge" title="Inactive — open to resume">inactive</span>` : '';
         const reviewToggle = isInactive ? '' : `<div class="review-toggle ${s.needsReview ? 'active' : ''}"
@@ -5533,12 +5654,13 @@ function renderTask() {
     if (t.plannedDay) meta.push('planned ' + shortDate(t.plannedDay));
     if (t.due) meta.push('due ' + shortDate(t.due));
     if (t.load) meta.push(escHtml(t.load));
-    meta.push(escHtml(t.owner === 'mq' ? 'MQ' : (t.owner || '')));
+    meta.push(escHtml(t.owner === me.id ? me.name : (t.owner || '')));
     if (t.waitingOn) meta.push('waiting on ' + escHtml(t.waitingOn));
     meta.push(d.dispatchReady
         ? '<span class="ready-pill">dispatch-ready</span>'
         : (hasBrief ? '<span class="blocked-pill">blocked on a question</span>' : ''));
-    const orcaLabel = hasBrief || t.briefPath ? 'Work on this with Orca' : 'Scope with Orca';
+    const agentName = escHtml(me.agent || 'Claude');
+    const orcaLabel = hasBrief || t.briefPath ? `Work on this with ${agentName}` : `Scope with ${agentName}`;
     const actions = [
         hasBrief ? `<a class="map-btn" href="${escAttr(brief.obsidianUrl)}">Open brief</a>` : '',
         t.noteUrl ? `<a class="map-btn" href="${escAttr(t.noteUrl)}">Open note</a>` : '',
@@ -5594,7 +5716,7 @@ function renderTask() {
     // Conversations
     const convs = d.conversations || [];
     const convHtml = convs.map(c => {
-        const who = c.actor ? c.actor : (c.kind === 'scheduled' ? 'sweep' : 'MQ');
+        const who = c.actor ? c.actor : (c.kind === 'scheduled' ? 'sweep' : me.name);
         const state = c.live ? (c.state || 'ready') : 'inactive';
         return `<div class="conv-row${c.live ? '' : ' dead'}" onclick="openConversation('${escAttr(c.sessionId)}')" title="${c.live ? 'Focus the iTerm tab' : 'Resume in a new tab'}">
             <span class="card-status ${state}"></span>

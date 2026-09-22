@@ -100,6 +100,7 @@ works as-is.
 | `mh verify` | check generated files match the store |
 | `mh regen` | rewrite every generated view |
 | `mh export` | a readable copy that needs no SQLite |
+| `mh init` | create an empty store, or rename its primary user |
 | `mh docs` | print this command reference as markdown |
 | `mh check-skills` | verify mh commands quoted in .claude are real |
 
