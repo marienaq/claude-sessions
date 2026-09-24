@@ -50,6 +50,8 @@ PLACEHOLDERS = {
     # scheduling
     "done_when": "Some text", "what_done_means": "Some text",
     "ready": "2026-10-12", "gap": "3", "lane": "aba", "value": "1.5",
+    "template": "course", "prefix": "Creating Documents", "course": "Creating Documents",
+    "n=key#id": "6=proj#1",
 }
 
 

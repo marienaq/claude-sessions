@@ -404,6 +404,127 @@ class TestRuleSettings(StoreCase):
 
 
 # ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+def _after(stages, n):
+    return {a for a, _ in next(st for st in stages if st["n"] == n)["after"]}
+
+
+class TestTemplateShape(unittest.TestCase):
+    """The templates against the methodology docs, stage by stage."""
+
+    def test_course_loads_match_the_methodology_table(self):
+        loads = {st["n"]: st["load"] for st in mhschedule.COURSE}
+        self.assertEqual(loads, {1: "shallow", 2: "deep", 3: "deep", 4: "deep",
+                                 **{n: "medium" for n in range(5, 17)}})
+
+    def test_course_is_a_line_then_four_parallel_tracks(self):
+        c = mhschedule.COURSE
+        for n in range(2, 7):
+            self.assertEqual(_after(c, n), {n - 1})
+        for initial in (7, 9, 11, 13):
+            self.assertEqual(_after(c, initial), {6}, f"stage {initial}")
+            final = next(st for st in c if st["n"] == initial + 1)
+            self.assertEqual(final["after"], ((initial, 3),))
+        self.assertEqual(_after(c, 15), {8, 10, 12, 14})
+        self.assertEqual(_after(c, 16), {15})
+        self.assertTrue(next(st for st in c if st["n"] == 16)["fixed"])
+
+    def test_the_sharla_gate(self):
+        by_n = {st["n"]: st for st in mhschedule.COURSE}
+        self.assertEqual(by_n[11]["same_day"], (9,))
+        self.assertEqual(by_n[12]["same_day"], (10,))
+
+    def test_champions_matches_its_week_shape(self):
+        c = mhschedule.CHAMPIONS
+        loads = {st["n"]: st["load"] for st in c}
+        self.assertEqual({n for n, l in loads.items() if l == "shallow"}, {3, 7, 10, 11})
+        by_n = {st["n"]: st for st in c}
+        for n in (4, 5, 6):
+            self.assertEqual(by_n[n]["after"], ((2, 7),), f"stage {n}")
+        self.assertEqual(by_n[5]["same_day"], (4,))
+        self.assertEqual(by_n[6]["same_day"], (4,))
+        self.assertTrue(by_n[10]["fixed"])
+        self.assertFalse(any("rehears" in st["name"] for st in c))
+        self.assertTrue(all(st["done_when"] for st in c + mhschedule.COURSE))
+
+    def test_self_paced_keeps_one_to_eight(self):
+        self.assertEqual([st["n"] for st in mhschedule.template("course", self_paced=True)],
+                         list(range(1, 9)))
+
+
+class TestTemplates(StoreCase):
+
+    def setUp(self):
+        super().setUp()
+        mhschedule.set_rule(self.store, "week_target", "0.5")
+
+    def test_apply_creates_the_rows_and_the_graph(self):
+        rows, n_deps = mhschedule.apply_template(self.store, "course", "aba-academy",
+                                                 "Creating Documents")
+        self.assertEqual(len(rows), 16)
+        first = rows[9][0]
+        self.assertEqual(first["title"],
+                         "Creating Documents: initial facilitation guide review (stage 9)")
+        self.assertTrue(first["done_when"])
+        self.assertEqual(rows[16][0]["fixed"], 1)
+        # 5 in the line, 4 initials, 4 finals, 4 into VILT prep, 1 into delivery, 2 same-day
+        self.assertEqual(len(self.store.deps()), 5 + 4 + 4 + 4 + 1 + 2)
+        for n, offset in GOOD.items():
+            self.store.plan_task(rows[n][0]["id"], day(offset))
+        self.assertEqual(mhschedule.violations(self.findings()), [])
+
+    def test_link_wires_existing_rows_and_bridges_a_gap(self):
+        made = {}
+        for n in (2, 3, 4, 6, 7, 8):
+            st = next(x for x in mhschedule.COURSE if x["n"] == n)
+            made[n] = self.add(mhschedule.stage_title("Extracting", st))
+        self.add("Something else: scoping (stage 2)")
+        rows, missing, _ = mhschedule.link_template(self.store, "course", "aba-academy",
+                                                    "Extracting")
+        self.assertEqual(missing, [1, 5, 9, 10, 11, 12, 13, 14, 15, 16])
+        waits = {d["depends_on_id"] for d in self.store.deps(task_id=made[6]["id"])}
+        self.assertEqual(waits, {made[4]["id"]})          # bridged past 5
+        gap = self.store.deps(task_id=made[8]["id"])[0]["min_gap_days"]
+        self.assertEqual(gap, 3)
+        before = len(self.store.deps())
+        mhschedule.link_template(self.store, "course", "aba-academy", "Extracting")
+        self.assertEqual(len(self.store.deps()), before)
+
+    def test_a_missing_track_passes_on_no_gap(self):
+        outline = self.add("Extracting: review course outline (stage 6)")
+        final = self.add("Extracting: final slides review (stage 12)")
+        prep = self.add("Extracting: VILT prep (stage 15)")
+        mhschedule.link_template(self.store, "course", "aba-academy", "Extracting")
+        waits = {d["depends_on_id"]: d["min_gap_days"]
+                 for d in self.store.deps(task_id=prep["id"])}
+        # Via 8, 10 and 14, all missing, prep reaches 6; via 12 it stops there.
+        self.assertEqual(waits, {outline["id"]: 0, final["id"]: 0})
+
+    def test_link_takes_a_split_stage(self):
+        agenda = self.add("Extracting: review the VILT agenda")
+        outline = self.add("Extracting: review the course outline")
+        guide = self.add("Extracting: initial facilitation guide review (stage 9)")
+        mhschedule.link_template(self.store, "course", "aba-academy", "Extracting",
+                                 overrides={6: [agenda, outline]})
+        waits = {d["depends_on_id"] for d in self.store.deps(task_id=guide["id"])}
+        self.assertEqual(waits, {agenda["id"], outline["id"]})
+
+
+class TestDayCaps(StoreCase):
+
+    def test_friday_can_take_a_half_day(self):
+        mhschedule.set_rule(self.store, "float_max_load", "medium")
+        mhschedule.set_rule(self.store, "day_caps", '{"Fri": 0.5}')
+        self.add("half day", planned_day=FRI, load="medium")
+        self.assertEqual(self.findings("lane") + self.findings("day_cap"), [])
+        self.add("another", planned_day=FRI, load="shallow")
+        self.assertEqual(self.findings("day_cap")[0]["message"],
+                         f"{FRI} carries 0.75 days against a 0.5 cap")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -482,6 +603,27 @@ class TestCli(CliCase):
         self.assertIn("day_cap", out)
         self.assertIn("setting", out)
         code, _ = self.run_cli("schedule", "set", "day_cap", "lots")
+        self.assertEqual(code, 1)
+
+    def test_template_verbs(self):
+        code, out = self.run_cli("template", "show", "course")
+        self.assertIn("after 6", out)
+        self.assertIn("same day as 9", out)
+        code, out = self.run_cli("template", "apply", "champions", "aba-academy",
+                                 "--prefix", "Champions November", "--actor", "sam")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.store.tasks(project_key="aba-academy")), 11)
+        agenda = self.add("Extracting: review the VILT agenda", display_ord="90")
+        guide = self.add("Extracting: initial facilitation guide review (stage 9)",
+                         display_ord="91")
+        code, out = self.run_cli("template", "link", "course", "aba-academy",
+                                 "--prefix", "Extracting", "--stage", "6=aba-academy#90")
+        self.assertEqual(code, 0, out)
+        self.assertIn("stage  6: aba-academy#90", out)
+        self.assertEqual(self.store.deps(task_id=guide["id"])[0]["depends_on_id"],
+                         agenda["id"])
+        code, out = self.run_cli("template", "link", "course", "aba-academy",
+                                 "--prefix", "Extracting", "--stage", "six=aba-academy#90")
         self.assertEqual(code, 1)
 
     def test_project_lane(self):

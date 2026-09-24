@@ -108,6 +108,15 @@ works as-is.
 | `mh schedule rules` | — | the rules in force, and where each comes from |
 | `mh schedule set <name> <value>` | — | change a rule: day_cap, week_target, days... |
 
+### `mh template`
+
+| Command | Options | What it does |
+|---|---|---|
+| `mh template list` | — | the templates there are |
+| `mh template show <name>` | `--self-paced` | a template's stages and what each waits on |
+| `mh template apply <name> <project>` | `--owner` `--prefix` `--self-paced` | create every stage row and its dependencies |
+| `mh template link <name> <project>` | `--prefix` `--self-paced` `--stage` | wire an in-flight course's existing rows to the template |
+
 ### Single commands
 
 | Command | What it does |

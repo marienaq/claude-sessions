@@ -33,6 +33,8 @@ DEFAULTS = {
     # The day a row with no load tag is counted as, so it is not free.
     "untagged_load": "medium",
     "day_cap": 1.5,
+    # A cap for a named day that differs from day_cap, e.g. {"Fri": 0.5}.
+    "day_caps": {},
     "week_target": 2.0,
     "week_stretch": 2.5,
     # MQ 2026-09-24: Monday and Wednesday are ABA, Tuesday and Thursday are
@@ -88,6 +90,13 @@ def _check_rule(name, value):
         if not isinstance(value, dict) or set(value) != set(mhstore.LOADS):
             raise RulesError(f"load_weights names each of {', '.join(mhstore.LOADS)}")
         return {k: float(v) for k, v in value.items()}
+    if name == "day_caps":
+        if not isinstance(value, dict) or any(d not in DAY_NAMES for d in value):
+            raise RulesError("day_caps maps a day (Mon..Sun) to a number of days")
+        try:
+            return {d: float(v) for d, v in value.items()}
+        except (TypeError, ValueError):
+            raise RulesError("day_caps values are numbers of days")
     if name == "days":
         if not isinstance(value, dict):
             raise RulesError("days maps Mon..Sun to aba, business or float")
@@ -236,13 +245,14 @@ def validate(store, placements=None, start=None):
         rows = by_day[d]
         total = sum(weight(t, r)[0] for t in rows)
         movable = [t for t in rows if not t["fixed"]]
-        if total > r["day_cap"] + 1e-9 and movable:
+        name = DAY_NAMES[date.fromisoformat(d).weekday()]
+        cap = r["day_caps"].get(name, r["day_cap"])
+        if total > cap + 1e-9 and movable:
             found.append(_finding(
                 "day_cap", "violation",
-                f"{d} carries {total:.2f} days against a {r['day_cap']:g} cap",
+                f"{d} carries {total:.2f} days against a {cap:g} cap",
                 rows, d, load=round(total, 2)))
 
-        name = DAY_NAMES[date.fromisoformat(d).weekday()]
         kind = r["days"].get(name)
         for t in movable:
             lane = store.lane(t["project_key"])
@@ -316,3 +326,204 @@ def validate(store, placements=None, start=None):
 
 def violations(findings):
     return [f for f in findings if f["level"] == "violation"]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline templates
+#
+# Transcribed from methodology/course-build-pipeline.md and
+# champions-session-pipeline.md. When one of those changes, this changes
+# with it; the tests hold the shape, not the prose.
+#
+# Each stage: (n, name, load, after, same_day, fixed, done_when). after is
+# ((stage, min_gap_days), ...); same_day names stages it shares a day with.
+# ---------------------------------------------------------------------------
+
+def _stage(n, name, load, after=(), same_day=(), fixed=False, done_when=None):
+    return {"n": n, "name": name, "load": load,
+            "after": tuple((a, 0) if isinstance(a, int) else a for a in after),
+            "same_day": tuple(same_day), "fixed": fixed,
+            "done_when": done_when}
+
+
+# The course pipeline is not a chain. 1 to 6 are sequential; then four review
+# tracks (Rise, facilitation guide, slides, QRG), each gated on 6 alone and on
+# Anushka delivering, each an initial and a final at least 3 days apart; 15
+# waits on all four finals. The guide and slides reviews share a day: MQ
+# reviews them together before anything goes to Sharla (the Sharla gate).
+COURSE = (
+    _stage(1, "research", "shallow",
+           done_when="Best practice and what the course should cover, written up"),
+    _stage(2, "scoping", "deep", after=(1,),
+           done_when="The teaching thesis and a test plan kit"),
+    _stage(3, "testing", "deep", after=(2,),
+           done_when="Raw notes from running the test plan kit in Copilot"),
+    _stage(4, "finalized scope", "deep", after=(3,),
+           done_when="Recommendation and course outline sent to Anushka and on Drive"),
+    _stage(5, "review with Anushka", "medium", after=(4,),
+           done_when="Findings shared and the build handed over"),
+    _stage(6, "review course outline", "medium", after=(5,),
+           done_when="Feedback on the course outline and the VILT agenda and session outline"),
+    _stage(7, "initial Rise review", "medium", after=(6,),
+           done_when="Feedback on Anushka's Rise draft"),
+    _stage(8, "final Rise review", "medium", after=((7, 3),),
+           done_when="Rise course signed off"),
+    _stage(9, "initial facilitation guide review", "medium", after=(6,),
+           done_when="Feedback on Anushka's facilitation guide draft"),
+    _stage(10, "final facilitation guide review", "medium", after=((9, 3),),
+           done_when="Facilitation guide signed off"),
+    _stage(11, "initial slides review", "medium", after=(6,), same_day=(9,),
+           done_when="Feedback on Anushka's slides draft"),
+    _stage(12, "final slides review", "medium", after=((11, 3),), same_day=(10,),
+           done_when="Slides signed off, and with the guide, sent to Sharla"),
+    _stage(13, "initial QRG review", "medium", after=(6,),
+           done_when="Feedback on Anushka's QRG draft"),
+    _stage(14, "final QRG review", "medium", after=((13, 3),),
+           done_when="QRG signed off"),
+    _stage(15, "VILT prep", "medium", after=(8, 10, 12, 14),
+           done_when="Ready to run"),
+    _stage(16, "deliver the workshop", "medium", after=(15,), fixed=True,
+           done_when="The session ran"),
+)
+
+# One monthly session, and a week per stage rather than a load sum. Concepts
+# go to Sharla and the build waits a week for her; the guide, slides and
+# reference guide are built on one day on purpose (1.5 days, accepted). No
+# rehearsal: MQ does not run one.
+CHAMPIONS = (
+    _stage(1, "session brief and scope", "medium",
+           done_when="Brief and scope agreed"),
+    _stage(2, "finalize concepts", "medium", after=(1,),
+           done_when="Concepts sent to Sharla"),
+    _stage(3, "pre-work email", "shallow", after=(1,),
+           done_when="Sharla's revisions in and the email sent"),
+    _stage(4, "facilitation guide", "medium", after=((2, 7),),
+           done_when="Facilitation guide built and aligned with the slides"),
+    _stage(5, "slides", "medium", after=((2, 7),), same_day=(4,),
+           done_when="Slides built and aligned with the guide"),
+    _stage(6, "reference guide", "medium", after=((2, 7),), same_day=(4,),
+           done_when="Reference guide built"),
+    _stage(7, "polls", "shallow", after=(1,),
+           done_when="Polls written"),
+    _stage(8, "build the demo", "medium", after=((2, 7),),
+           done_when="Demo built and run through once"),
+    _stage(9, "incorporate Sharla's feedback and finalize", "medium",
+           after=(4, 5, 6),
+           done_when="Sharla's feedback in and the materials final"),
+    _stage(10, "deliver the session", "shallow", after=(3, 7, 8, 9), fixed=True,
+           done_when="The session ran"),
+    _stage(11, "post-session follow-up", "shallow", after=(10,),
+           done_when="Follow-up sent"),
+)
+
+TEMPLATES = {
+    "course": {"stages": COURSE,
+               "about": "course build, 16 stages, four parallel review tracks",
+               # Self-paced courses drop the guide, slides and QRG reviews
+               # and the VILT (course-build-pipeline.md, Known variations).
+               "self_paced_drops": (9, 10, 11, 12, 13, 14, 15, 16)},
+    "champions": {"stages": CHAMPIONS,
+                  "about": "one AI Champions session, 11 stages",
+                  "self_paced_drops": ()},
+}
+
+
+def template(name, self_paced=False):
+    if name not in TEMPLATES:
+        raise RulesError(f"no template {name!r}; there are {', '.join(TEMPLATES)}")
+    t = TEMPLATES[name]
+    if self_paced and not t["self_paced_drops"]:
+        raise RulesError(f"{name} has no self-paced variant")
+    drop = set(t["self_paced_drops"]) if self_paced else set()
+    return [st for st in t["stages"] if st["n"] not in drop]
+
+
+def stage_title(prefix, st):
+    return f"{prefix}: {st['name']} (stage {st['n']})"
+
+
+def _wire(store, stages, rows, actor):
+    """
+    Dependencies between stage rows. rows maps stage -> [task rows]; a stage
+    with no rows is bridged, so its dependents wait on its predecessors
+    instead (a closed stage 5 that was never recorded must not free stage 6
+    from stage 4). Returns the number of dependencies written.
+    """
+    by_n = {st["n"]: st for st in stages}
+
+    def preds(n):
+        """
+        {row id: gap} stage n waits on, walking past unmapped stages. Only
+        the gap on the edge that reaches a real row counts: a missing stage
+        passes on what it waited for, not its own spacing. Extracting has no
+        QRG reviews, and their 3-day pair must not delay its VILT prep.
+        """
+        out = {}
+        for p, g in by_n[n]["after"]:
+            found = {r["id"]: g for r in rows.get(p, [])} or preds(p)
+            for rid, gap in found.items():
+                out[rid] = max(out.get(rid, 0), gap)
+        return out
+
+    n_deps = 0
+    for st in stages:
+        for row in rows.get(st["n"], []):
+            for pred_id, gap in preds(st["n"]).items():
+                store.add_dep(row["id"], pred_id, actor=actor, gap=gap)
+                n_deps += 1
+            for other in st["same_day"]:
+                for pred in rows.get(other, []):
+                    store.add_dep(row["id"], pred["id"], actor=actor,
+                                  kind="same_day")
+                    n_deps += 1
+    return n_deps
+
+
+def apply_template(store, name, project_key, prefix, actor="system",
+                   self_paced=False, owner=None):
+    """Create every stage row and its dependencies in one transaction."""
+    stages = template(name, self_paced)
+    prefix = prefix.strip()
+    if not prefix:
+        raise RulesError("a template needs --prefix, the course or session name")
+    rows = {}
+    with store.write():
+        for st in stages:
+            rows[st["n"]] = [store.add_task(
+                project_key, stage_title(prefix, st), actor=actor,
+                load=st["load"], fixed=st["fixed"], done_when=st["done_when"],
+                owner=owner, source="planning")]
+        n_deps = _wire(store, stages, rows, actor)
+    return rows, n_deps
+
+
+def link_template(store, name, project_key, prefix, overrides=None,
+                  actor="system", self_paced=False):
+    """
+    Wire an in-flight course's existing rows to the template's dependencies.
+
+    A row belongs to stage N if its title starts with the prefix and says
+    "(stage N)"; overrides ({N: [task rows]}) name rows whose titles do not,
+    or a stage split into two rows. Nothing is created. Returns
+    (rows by stage, stages with no row, dependencies written).
+    """
+    import re
+    stages = template(name, self_paced)
+    overrides = overrides or {}
+    known = {st["n"] for st in stages}
+    bad = set(overrides) - known
+    if bad:
+        raise RulesError(f"{name} has no stage {sorted(bad)}")
+    rows = {}
+    want = prefix.strip().lower()
+    for t in store.tasks(project_key=project_key):
+        if t["status"] == "canceled" or not t["title"].lower().startswith(want):
+            continue
+        m = re.search(r"\(stage (\d+)\)", t["title"])
+        if m and int(m.group(1)) in known:
+            rows.setdefault(int(m.group(1)), []).append(t)
+    rows.update(overrides)
+    with store.write():
+        n_deps = _wire(store, stages, rows, actor)
+    missing = [st["n"] for st in stages if not rows.get(st["n"])]
+    return rows, missing, n_deps

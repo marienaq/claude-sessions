@@ -909,6 +909,87 @@ def cmd_schedule_set(store, repo, args):
 
 
 # ---------------------------------------------------------------------------
+# template
+# ---------------------------------------------------------------------------
+
+def cmd_template_list(store, repo, args):
+    for name, t in mhschedule.TEMPLATES.items():
+        print(f"{name:<12} {t['about']}")
+    return 0
+
+
+def cmd_template_show(store, repo, args):
+    """The stages, their loads, and what each waits on."""
+    try:
+        stages = mhschedule.template(args.name, args.self_paced)
+    except mhschedule.RulesError as exc:
+        raise CliError(str(exc))
+    for st in stages:
+        waits = ", ".join(f"{n}" + (f" +{g}d" if g else "") for n, g in st["after"])
+        extra = []
+        if waits:
+            extra.append(f"after {waits}")
+        if st["same_day"]:
+            extra.append("same day as " + ", ".join(map(str, st["same_day"])))
+        if st["fixed"]:
+            extra.append("fixed")
+        print(f"{st['n']:>3}  {st['name']:<44} {st['load']:<8} {'; '.join(extra)}")
+    return 0
+
+
+def _stage_overrides(store, values):
+    """--stage 6=aba-academy#44,aba-academy#45 -> {6: [row, row]}."""
+    out = {}
+    for value in values or ():
+        n, sep, idents = value.partition("=")
+        if not sep or not n.strip().isdigit():
+            raise CliError(f"--stage takes N=key#id[,key#id], not {value!r}")
+        out[int(n)] = [resolve(store, i) for i in idents.split(",") if i.strip()]
+    return out
+
+
+def cmd_template_apply(store, repo, args):
+    if not store.project(args.project):
+        raise CliError(f"no project {args.project!r}; see `mh project list`")
+    try:
+        rows, n_deps = mhschedule.apply_template(
+            store, args.name, args.project, args.prefix, actor=args.actor,
+            self_paced=args.self_paced, owner=args.owner)
+    except mhschedule.RulesError as exc:
+        raise CliError(str(exc))
+    for n, made in rows.items():
+        print(show(store, made[0]))
+    print(f"\n{len(rows)} rows, {n_deps} dependencies; none planned. "
+          f"Place them, then `mh schedule validate --project {args.project}`.")
+    if not args.no_regen:
+        regenerate(store, repo, [args.project])
+    return 0
+
+
+def cmd_template_link(store, repo, args):
+    """Wire an in-flight course's existing rows to the template. Creates nothing."""
+    overrides = _stage_overrides(store, args.stage)
+    try:
+        rows, missing, n_deps = mhschedule.link_template(
+            store, args.name, args.project, args.prefix, overrides=overrides,
+            actor=args.actor, self_paced=args.self_paced)
+    except mhschedule.RulesError as exc:
+        raise CliError(str(exc))
+    for n in sorted(rows):
+        print(f"stage {n:>2}: " + ", ".join(
+            f"{tag(t)} ({t['status']}{', ' + t['planned_day'] if t['planned_day'] else ''})"
+            for t in rows[n]))
+    if missing:
+        print(f"no row for stage {', '.join(map(str, missing))}: bridged, so "
+              "what follows waits on what came before. Pass --stage N=key#id "
+              "for a row whose title does not say its stage.")
+    print(f"{n_deps} dependencies wired")
+    if not args.no_regen:
+        regenerate(store, repo, [args.project])
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # plan, project, report
 # ---------------------------------------------------------------------------
 
@@ -1748,6 +1829,34 @@ def build_parser():
     p.add_argument("name", choices=tuple(mhschedule.DEFAULTS))
     p.add_argument("value", help="a number, a load, or JSON")
     p.set_defaults(fn=cmd_schedule_set)
+
+    tmpl = sub.add_parser("template", help="pipeline templates: course, champions",
+                          parents=[common]).add_subparsers(dest="action", required=True)
+
+    p = tmpl.add_parser("list", help="the templates there are", parents=[common])
+    p.set_defaults(fn=cmd_template_list)
+
+    p = tmpl.add_parser("show", help="a template's stages and what each waits on", parents=[common])
+    p.add_argument("name", choices=tuple(mhschedule.TEMPLATES))
+    p.add_argument("--self-paced", action="store_true", help="the variant with no VILT")
+    p.set_defaults(fn=cmd_template_show)
+
+    p = tmpl.add_parser("apply", help="create every stage row and its dependencies", parents=[common])
+    p.add_argument("name", choices=tuple(mhschedule.TEMPLATES))
+    p.add_argument("project")
+    p.add_argument("--prefix", required=True, help="the course or session name, e.g. \"Creating Documents\"")
+    p.add_argument("--self-paced", action="store_true", help="drop the guide, slides, QRG reviews and the VILT")
+    p.add_argument("--owner")
+    p.set_defaults(fn=cmd_template_apply)
+
+    p = tmpl.add_parser("link", help="wire an in-flight course's existing rows to the template", parents=[common])
+    p.add_argument("name", choices=tuple(mhschedule.TEMPLATES))
+    p.add_argument("project")
+    p.add_argument("--prefix", required=True, help="the title prefix its rows share")
+    p.add_argument("--stage", action="append", metavar="N=KEY#ID",
+                   help="a row whose title does not say its stage; repeatable")
+    p.add_argument("--self-paced", action="store_true")
+    p.set_defaults(fn=cmd_template_link)
 
     p = sub.add_parser("report", help="a week summary for Slack", parents=[common])
     p.add_argument("week", nargs="?")
