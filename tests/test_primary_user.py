@@ -125,7 +125,7 @@ class TestInit(unittest.TestCase):
                                      "demo", "Demo", "--dir", "demo")
             self.assertEqual(code, 0, out)
             code, out = self.run_cli("--repo", str(repo), "task", "add",
-                                     "demo", "Hello")
+                                     "demo", "Hello", "--load", "shallow", "--done-when", "It exists")
             self.assertEqual(code, 0)
             listing = (repo / "demo" / "task-list.md").read_text()
             self.assertIn("| Hello |", listing)

@@ -47,6 +47,9 @@ PLACEHOLDERS = {
     "what_you_would_do": "Some answer", "brief_path": "some/brief.md",
     "handback": "MQ", "reason": "Some reason", "expect": "some/path.md",
     "artifact": "some/path.md", "findings": "some/findings.md",
+    # scheduling
+    "done_when": "Some text", "what_done_means": "Some text",
+    "ready": "2026-10-12", "gap": "3", "lane": "aba", "value": "1.5",
 }
 
 
@@ -158,11 +161,17 @@ def check(command, parser):
 
     try:
         with contextlib.redirect_stderr(io.StringIO()):
-            parser.parse_args(argv)
+            parsed = parser.parse_args(argv)
     except SystemExit:
         return "not a valid mh command"
     except Exception as exc:                     # noqa: BLE001
         return f"{type(exc).__name__}: {exc}"
+    # What argparse cannot say (a task needs --load unless it is a proposal)
+    # is checked by the same function main() runs.
+    try:
+        mhcli.check_args(parsed)
+    except mhcli.CliError as exc:
+        return str(exc)
     return None
 
 

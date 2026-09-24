@@ -33,6 +33,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import mhgen
+import mhschedule
 import mhsession
 import mhstore
 from mhstore import ONE_OFF, OPEN_STATUSES, StoreError
@@ -98,10 +99,39 @@ def resolve(store, ident):
     return task
 
 
-def tag(task):
-    if task["project_key"] != ONE_OFF and task["display_ord"]:
-        return f"{task['project_key']}#{task['display_ord']}"
-    return f"#{task['id']}"
+tag = mhstore.tag
+
+
+def _iso_day(value):
+    """YYYY-MM-DD, checked, so a typo cannot land as a date the scheduler reads."""
+    try:
+        return date.fromisoformat(str(value).strip()).isoformat()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a date (YYYY-MM-DD)")
+
+
+def _day_or_none(value):
+    return "none" if mhstore.clean(value) is None else _iso_day(value)
+
+
+def _yes_no(value):
+    text = str(value).strip().lower()
+    if text in ("yes", "y", "true", "1", "on"):
+        return True
+    if text in ("no", "n", "false", "0", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"{value!r}: say yes or no")
+
+
+def check_args(args):
+    """
+    Rules argparse cannot state, checked after parsing. main() runs this and
+    so does check_mh_usage, so a skill line that breaks one fails the skill
+    check rather than failing mid-task.
+    """
+    # Nothing yet. `mh task add` will require --load and --done-when here,
+    # once the skills that call it pass both (see ai-workflows#18).
+    return None
 
 
 def show(store, task, prefix=""):
@@ -258,7 +288,8 @@ def cmd_task_add(store, repo, args):
         confirmed=0 if args.unconfirmed else 1,
         status="planned" if args.day else "backlog",
         planned_day=args.day, load=args.load, due=args.due,
-        owner=args.owner, notes=args.note)
+        owner=args.owner, notes=args.note, done_when=args.done_when,
+        fixed=args.fixed, external_ready_date=args.ready)
     print(show(store, task))
     if not args.no_regen:
         regenerate(store, repo, [project])
@@ -411,10 +442,18 @@ def cmd_task_set(store, repo, args):
     if args.notion is not None:
         fields["notion_task_id"] = _blank_is_none(args.notion)
     if args.depends_on is not None:
+        # The single-predecessor, zero-gap case of `mh dep add`, kept for the
+        # skills that already say it. It replaces every other predecessor.
         if _blank_is_none(args.depends_on) is None:
             fields["depends_on"] = None
         else:
             fields["depends_on"] = resolve(store, args.depends_on)["id"]
+    if args.done_when is not None:
+        fields["done_when"] = _blank_is_none(args.done_when)
+    if args.fixed is not None:
+        fields["fixed"] = args.fixed
+    if args.ready is not None:
+        fields["external_ready_date"] = None if args.ready == "none" else args.ready
     if not fields:
         raise CliError("nothing to set; see `mh task set --help`")
     store.update_task(task["id"], actor=args.actor, **fields)
@@ -739,6 +778,137 @@ def cmd_task_list(store, repo, args):
 
 
 # ---------------------------------------------------------------------------
+# dep
+# ---------------------------------------------------------------------------
+
+def _show_dep(store, dep, direction):
+    """One line: 'waits on X' from the dependent's side, 'blocks Y' from the other."""
+    other = store.task(dep["depends_on_id"] if direction == "waits on" else dep["task_id"])
+    how = "same day as" if dep["kind"] == "same_day" else direction
+    gap = f"  (+{dep['min_gap_days']}d)" if dep["min_gap_days"] else ""
+    return (f"    {how:<12} {tag(other):<22} {other['status']:<11} "
+            f"{other['planned_day'] or '—':<10} {other['title'][:40]}{gap}")
+
+
+def cmd_dep_add(store, repo, args):
+    task, pred = resolve(store, args.task), resolve(store, args.on)
+    kind = "same_day" if args.same_day else "finish_to_start"
+    if args.same_day and args.gap:
+        raise CliError("--same-day and --gap contradict each other")
+    dep = store.add_dep(task["id"], pred["id"], actor=args.actor,
+                        gap=args.gap or 0, kind=kind)
+    print(show(store, task))
+    print(_show_dep(store, dep, "waits on"))
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
+def cmd_dep_rm(store, repo, args):
+    task, pred = resolve(store, args.task), resolve(store, args.on)
+    if not store.remove_dep(task["id"], pred["id"], actor=args.actor):
+        raise CliError(f"{tag(task)} does not depend on {tag(pred)}")
+    print(f"{tag(task)} no longer waits on {tag(pred)}")
+    if not args.no_regen:
+        regenerate(store, repo, [task["project_key"]])
+    return 0
+
+
+def cmd_dep_list(store, repo, args):
+    """Both directions: what each row waits on, and what it blocks."""
+    target = args.target.strip().strip("`")
+    if store.project(target):
+        rows = [t for t in store.tasks(project_key=target)
+                if store.deps(task_id=t["id"]) or store.deps(depends_on_id=t["id"])]
+    else:
+        rows = [resolve(store, target)]
+    if args.json:
+        print(json.dumps([{"tag": tag(t), "id": t["id"],
+                           "waits_on": [{**d, "tag": tag(store.task(d["depends_on_id"]))}
+                                        for d in store.deps(task_id=t["id"])],
+                           "blocks": [{**d, "tag": tag(store.task(d["task_id"]))}
+                                      for d in store.deps(depends_on_id=t["id"])]}
+                          for t in rows], indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("no dependencies")
+        return 0
+    for t in rows:
+        print(show(store, t))
+        for d in store.deps(task_id=t["id"]):
+            print(_show_dep(store, d, "waits on"))
+        for d in store.deps(depends_on_id=t["id"]):
+            print(_show_dep(store, d, "blocks"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# schedule
+# ---------------------------------------------------------------------------
+
+def cmd_schedule_validate(store, repo, args):
+    """
+    Hold the committed schedule to the rules. Read-only: writes nothing, not
+    even weeks.rules_report, so it is safe against any store. Exits 1 when
+    something is broken, like `mh verify`.
+    """
+    try:
+        found = mhschedule.validate(store, start=args.start)
+    except mhschedule.RulesError as exc:
+        raise CliError(str(exc))
+    if args.project:
+        ids = {t["id"] for t in store.tasks(project_key=args.project)}
+        found = [f for f in found if ids & set(f["tasks"])]
+    if args.json:
+        print(json.dumps(found, indent=2, ensure_ascii=False))
+        return 1 if mhschedule.violations(found) else 0
+
+    titles = dict(mhschedule.RULES)
+    for rule in titles:
+        mine = [f for f in found if f["rule"] == rule]
+        if not mine:
+            continue
+        bad = sum(1 for f in mine if f["level"] == "violation")
+        head = f"{bad} violation(s)" if bad else "notice"
+        print(f"\n{rule}: {titles[rule]}  [{head}]")
+        for f in mine:
+            mark = "!" if f["level"] == "violation" else "·"
+            print(f"  {mark} {f['message']}")
+            if rule in ("day_cap", "week") and f["level"] == "violation":
+                print(f"      {', '.join(f['tags'])}")
+            if rule == "backlog":
+                for key, v in f["by_project"].items():
+                    print(f"      {key:<20} {v['rows']:>3} rows  {v['days']:>5.2f} days")
+    n = len(mhschedule.violations(found))
+    print(f"\n{n} violation(s)" if n else "\nno violations")
+    return 1 if n else 0
+
+
+def cmd_schedule_rules(store, repo, args):
+    try:
+        current = mhschedule.rules(store)
+    except mhschedule.RulesError as exc:
+        raise CliError(str(exc))
+    if args.json:
+        print(json.dumps(current, indent=2))
+        return 0
+    for name, rule in current.items():
+        print(f"{name:<16} {json.dumps(rule['value']):<60} {rule['source']}")
+    print("\nChange one with `mh schedule set <name> <value>`. Project lanes: "
+          "`mh project set <project> --lane aba|business|any|auto`.")
+    return 0
+
+
+def cmd_schedule_set(store, repo, args):
+    try:
+        value = mhschedule.set_rule(store, args.name, args.value, actor=args.actor)
+    except mhschedule.RulesError as exc:
+        raise CliError(str(exc))
+    print(f"{args.name} = {json.dumps(value)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # plan, project, report
 # ---------------------------------------------------------------------------
 
@@ -855,6 +1025,8 @@ def cmd_project_set(store, repo, args):
         fields["owner"] = store.normalize_owner(args.owner)
     if args.notion is not None:
         fields["notion_project_id"] = _blank_is_none(args.notion)
+    if args.lane is not None:
+        fields["lane"] = None if args.lane == "auto" else args.lane
     if not fields:
         raise CliError("nothing to set; see `mh project set --help`")
     project = store.update_project(args.project, actor=args.actor, **fields)
@@ -1354,6 +1526,11 @@ def build_parser():
     p.add_argument("--source", default="agent", choices=mhstore.SOURCES)
     p.add_argument("--unconfirmed", action="store_true",
                    help="a proposal for MQ, not a commitment")
+    p.add_argument("--done-when", help="what finished means, one sentence")
+    p.add_argument("--fixed", action="store_true",
+                   help="cannot move: a session or a delivery")
+    p.add_argument("--ready", type=_iso_day,
+                   help="YYYY-MM-DD the other party delivers what this reviews")
     p.set_defaults(fn=cmd_task_add)
 
     p = task.add_parser("done", help="close a task", parents=[common])
@@ -1390,6 +1567,10 @@ def build_parser():
     p.add_argument("--section", help="the sub-heading its table sits under; 'none' clears")
     p.add_argument("--depends-on", help="key#N it waits for; 'none' clears")
     p.add_argument("--notion", help="Notion task id; 'none' clears")
+    p.add_argument("--done-when", help="what finished means; 'none' clears")
+    p.add_argument("--fixed", type=_yes_no, help="yes or no: cannot move")
+    p.add_argument("--ready", type=_day_or_none,
+                   help="YYYY-MM-DD the other party delivers; 'none' clears")
     p.set_defaults(fn=cmd_task_set)
 
     p = task.add_parser("owner", help="hand a task to someone (mq, or a person's name)", parents=[common])
@@ -1522,12 +1703,51 @@ def build_parser():
     p.add_argument("--goal", help="'none' clears")
     p.add_argument("--owner")
     p.add_argument("--notion", help="Notion project id; 'none' clears")
+    p.add_argument("--lane", choices=(*mhstore.LANES, "auto"),
+                   help="which days its work belongs on; auto infers from the key")
     p.set_defaults(fn=cmd_project_set)
 
     p = project.add_parser("status", help="set a project's status", parents=[common])
     p.add_argument("project")
     p.add_argument("status")
     p.set_defaults(fn=cmd_project_status)
+
+    dep = sub.add_parser("dep", help="dependencies between tasks",
+                         parents=[common]).add_subparsers(dest="action", required=True)
+
+    p = dep.add_parser("add", help="a task waits on another, by at least --gap days", parents=[common])
+    p.add_argument("task")
+    p.add_argument("--on", required=True, help="the key#N it waits on")
+    p.add_argument("--gap", type=int, default=0, help="minimum calendar days between them")
+    p.add_argument("--same-day", action="store_true",
+                   help="the two land on one day instead (the Sharla gate)")
+    p.set_defaults(fn=cmd_dep_add)
+
+    p = dep.add_parser("rm", help="remove a dependency", parents=[common])
+    p.add_argument("task")
+    p.add_argument("--on", required=True)
+    p.set_defaults(fn=cmd_dep_rm)
+
+    p = dep.add_parser("list", help="what a task or project waits on, and blocks", parents=[common])
+    p.add_argument("target", help="key#N or a project key")
+    p.set_defaults(fn=cmd_dep_list)
+
+    schedule = sub.add_parser("schedule", help="scheduling rules and the check against them",
+                              parents=[common]).add_subparsers(dest="action", required=True)
+
+    p = schedule.add_parser("validate", help="every rule the committed schedule breaks; read-only", parents=[common])
+    p.add_argument("--project", help="only findings touching this project")
+    p.add_argument("--from", dest="start", type=_iso_day,
+                   help="check capacity from this day (default today)")
+    p.set_defaults(fn=cmd_schedule_validate)
+
+    p = schedule.add_parser("rules", help="the rules in force, and where each comes from", parents=[common])
+    p.set_defaults(fn=cmd_schedule_rules)
+
+    p = schedule.add_parser("set", help="change a rule: day_cap, week_target, days...", parents=[common])
+    p.add_argument("name", choices=tuple(mhschedule.DEFAULTS))
+    p.add_argument("value", help="a number, a load, or JSON")
+    p.set_defaults(fn=cmd_schedule_set)
 
     p = sub.add_parser("report", help="a week summary for Slack", parents=[common])
     p.add_argument("week", nargs="?")
@@ -1600,6 +1820,12 @@ def main(argv=None):
               f"Set MELLONHEAD_ROOT or pass --repo. To create one, run "
               f"`mh init --repo {repo} --user <you>`.", file=sys.stderr)
         return 2
+
+    try:
+        check_args(args)
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     store = mhstore.open_store(root=repo, seed_settings=False)
     try:

@@ -25,9 +25,10 @@ from pathlib import Path
 
 import mhsession
 
-# 2 added events, questions and sessions (the task view). Stored in
-# PRAGMA user_version so open_store() can tell a v1 file from a v2 one.
-SCHEMA_VERSION = 2
+# 2 added events, questions and sessions (the task view). 3 added deps and
+# the scheduling fields (fixed, external_ready_date, done_when, lane). Stored
+# in PRAGMA user_version so open_store() can tell one file from another.
+SCHEMA_VERSION = 3
 
 # Task lifecycle. The markdown these came from used 48 distinct strings for
 # these seven states; see normalize_status.
@@ -46,6 +47,15 @@ _PROJECT_STATUS_ALIASES = {"closed": "done", "canceled": "cancelled",
                            "complete": "done", "completed": "done"}
 
 LOADS = ("deep", "medium", "shallow")
+
+# How a dependency constrains two rows. finish_to_start: the dependent's day
+# is at least min_gap_days after the predecessor's. same_day: the two land on
+# one day, which is how the Sharla gate and the Champions build day are said.
+DEP_KINDS = ("finish_to_start", "same_day")
+
+# Which days a project's work belongs on. NULL on the row means inferred from
+# the key (aba-* is aba); 'any' is for work with no lane, like one-offs.
+LANES = ("aba", "business", "any")
 SOURCES = ("manual", "capture", "planning", "agent", "migration")
 
 # What an event records. The task page renders one line per kind, so the
@@ -115,6 +125,24 @@ DEFAULT_SETTINGS = {
 # Schema
 # ---------------------------------------------------------------------------
 
+# Added in schema 3. Kept as (name, definition) so a fresh store creates them
+# in CREATE TABLE and an older one gets them by ALTER TABLE, from one list.
+TASK_V3 = (
+    # Cannot move: a session, a VILT delivery. Still consumes capacity, but
+    # is exempt from the day cap and the lane rules.
+    ("fixed", "INTEGER NOT NULL DEFAULT 0 CHECK (fixed IN (0, 1))"),
+    # When another party delivers the thing this row reviews. The row cannot
+    # be planned before it.
+    ("external_ready_date", "TEXT"),
+    # What finished means, in a sentence, written when the row is created.
+    ("done_when", "TEXT"),
+)
+PROJECT_V3 = (
+    ("lane", f"TEXT CHECK (lane IS NULL OR lane IN {LANES!r})"),
+)
+TASK_V3_COLUMNS = "".join(f",\n    {n} {d}" for n, d in TASK_V3)
+PROJECT_V3_COLUMNS = "".join(f",\n    {n} {d}" for n, d in PROJECT_V3)
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS projects (
     key                TEXT PRIMARY KEY,
@@ -130,7 +158,7 @@ CREATE TABLE IF NOT EXISTS projects (
     notion_project_id  TEXT,
     goal               TEXT,
     created_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL
+    updated_at         TEXT NOT NULL{PROJECT_V3_COLUMNS}
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -170,7 +198,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     confirmed      INTEGER NOT NULL DEFAULT 1 CHECK (confirmed IN (0, 1)),
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
-    done_at        TEXT
+    done_at        TEXT{TASK_V3_COLUMNS}
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_key, status);
@@ -231,6 +259,21 @@ CREATE TABLE IF NOT EXISTS questions (
     source       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_questions_open ON questions(status, project_key);
+
+-- One row per dependency. Replaces tasks.depends_on, which held one id at
+-- most and, on the legacy rows, a comma-joined string of ids formatted to
+-- look like tags. Many predecessors per task, each with its own gap.
+CREATE TABLE IF NOT EXISTS deps (
+    task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    min_gap_days   INTEGER NOT NULL DEFAULT 0 CHECK (min_gap_days >= 0),
+    kind           TEXT NOT NULL DEFAULT 'finish_to_start'
+                   CHECK (kind IN {DEP_KINDS!r}),
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_id),
+    CHECK (task_id <> depends_on_id)
+);
+CREATE INDEX IF NOT EXISTS idx_deps_on ON deps(depends_on_id);
 
 -- Every Claude conversation the store has seen write to it.
 CREATE TABLE IF NOT EXISTS sessions (
@@ -546,6 +589,20 @@ def word_overlap(a, b):
 # Store
 # ---------------------------------------------------------------------------
 
+def tag(task):
+    """key#N, or #id for a row with no project number. What mh prints."""
+    if task["project_key"] != ONE_OFF and task["display_ord"]:
+        return f"{task['project_key']}#{task['display_ord']}"
+    return f"#{task['id']}"
+
+
+def default_lane(project_key):
+    """The lane a project is in when nobody has said: aba-* is ABA work."""
+    if project_key == ONE_OFF:
+        return "any"
+    return "aba" if project_key.startswith("aba-") else "business"
+
+
 class StoreError(Exception):
     pass
 
@@ -781,13 +838,121 @@ class Store:
                 ORDER BY is_next DESC, seq IS NULL, seq, id""",
             (project_key, self.primary_user, *OPEN_STATUSES)).fetchall()
         for row in rows:
-            dep = row["depends_on"]
-            if dep:
-                blocker = self.task(dep)
-                if blocker and blocker["status"] not in ("done", "canceled"):
-                    continue
+            if self.open_predecessors(row["id"]):
+                continue
             return dict(row)
         return None
+
+    def lane(self, project_key):
+        """The project's lane: as set, else inferred from its key."""
+        row = self.project(project_key)
+        return (row and row.get("lane")) or default_lane(project_key)
+
+    # -- dependencies ------------------------------------------------------
+
+    def deps(self, task_id=None, depends_on_id=None):
+        """Dependency rows, either direction, oldest first."""
+        sql, args = "SELECT * FROM deps WHERE 1=1", []
+        if task_id is not None:
+            sql += " AND task_id = ?"
+            args.append(task_id)
+        if depends_on_id is not None:
+            sql += " AND depends_on_id = ?"
+            args.append(depends_on_id)
+        sql += " ORDER BY created_at, task_id, depends_on_id"
+        return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def open_predecessors(self, task_id):
+        """finish_to_start predecessors of a row that are not closed."""
+        return [dict(r) for r in self.conn.execute(
+            """SELECT t.* FROM deps d JOIN tasks t ON t.id = d.depends_on_id
+               WHERE d.task_id = ? AND d.kind = 'finish_to_start'
+                 AND t.status NOT IN ('done', 'canceled')""", (task_id,))]
+
+    def _reaches(self, start, target):
+        """True if target is start or one of start's predecessors, transitively."""
+        seen, stack = set(), [start]
+        while stack:
+            node = stack.pop()
+            if node == target:
+                return True
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(r[0] for r in self.conn.execute(
+                "SELECT depends_on_id FROM deps WHERE task_id = ? "
+                "AND kind = 'finish_to_start'", (node,)))
+        return False
+
+    def add_dep(self, task_id, depends_on_id, actor="system", gap=0,
+                kind="finish_to_start"):
+        """
+        task waits on depends_on, by at least gap days. Re-adding an existing
+        pair updates its gap and kind rather than failing, so a skill can say
+        what it wants without first asking what is there.
+        """
+        task, pred = self.task(task_id), self.task(depends_on_id)
+        if not task or not pred:
+            raise StoreError(f"no task {task_id if not task else depends_on_id}")
+        if task_id == depends_on_id:
+            raise StoreError(f"{tag(task)} cannot depend on itself")
+        if kind not in DEP_KINDS:
+            raise StoreError(f"bad dependency kind {kind!r}")
+        gap = int(gap or 0)
+        if gap < 0:
+            raise StoreError("a gap cannot be negative")
+        # A same_day pair has no direction, so it cannot close a cycle; a
+        # finish_to_start edge closes one if the predecessor already waits,
+        # however indirectly, on the dependent.
+        if kind == "finish_to_start" and self._reaches(depends_on_id, task_id):
+            raise StoreError(f"{tag(task)} on {tag(pred)} would make a cycle: "
+                             f"{tag(pred)} already waits on {tag(task)}")
+        before = self.conn.execute(
+            "SELECT min_gap_days, kind FROM deps WHERE task_id = ? AND depends_on_id = ?",
+            (task_id, depends_on_id)).fetchone()
+        before = dict(before) if before else None
+        after = {"depends_on": depends_on_id, "min_gap_days": gap, "kind": kind}
+        if before == {"min_gap_days": gap, "kind": kind}:
+            return self.deps(task_id=task_id, depends_on_id=depends_on_id)[0]
+        self.conn.execute(
+            """INSERT INTO deps (task_id, depends_on_id, min_gap_days, kind, created_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(task_id, depends_on_id) DO UPDATE SET
+                 min_gap_days = excluded.min_gap_days, kind = excluded.kind""",
+            (task_id, depends_on_id, gap, kind, _now()))
+        how = "same day as" if kind == "same_day" else "depends on"
+        summary = f"{how} {tag(pred)}" + (f", {gap}+ days after" if gap else "")
+        self._audit(actor, "dep.add", task_id, before, after,
+                    kind="update", summary=summary)
+        self._commit_if_top()
+        return self.deps(task_id=task_id, depends_on_id=depends_on_id)[0]
+
+    def remove_dep(self, task_id, depends_on_id, actor="system"):
+        row = self.deps(task_id=task_id, depends_on_id=depends_on_id)
+        if not row:
+            return False
+        self.conn.execute("DELETE FROM deps WHERE task_id = ? AND depends_on_id = ?",
+                          (task_id, depends_on_id))
+        pred = self.task(depends_on_id)
+        self._audit(actor, "dep.rm", task_id,
+                    {k: row[0][k] for k in ("depends_on_id", "min_gap_days", "kind")},
+                    None, kind="update",
+                    summary=f"no longer depends on {tag(pred) if pred else depends_on_id}")
+        self._commit_if_top()
+        return True
+
+    def _set_sole_predecessor(self, task_id, depends_on_id, actor):
+        """
+        What `depends_on=` has always meant: this one row and no other. Kept
+        so `mh task set --depends-on` and the older callers still work; it
+        writes to deps, never to the legacy column.
+        """
+        with self.write():
+            for row in self.deps(task_id=task_id):
+                if row["kind"] == "finish_to_start" and row["depends_on_id"] != depends_on_id:
+                    self.remove_dep(task_id, row["depends_on_id"], actor=actor)
+            if depends_on_id is not None:
+                self.add_dep(task_id, depends_on_id, actor=actor)
 
     def setting(self, key, default=None):
         row = self.conn.execute(
@@ -823,12 +988,14 @@ class Store:
         if not before:
             raise StoreError(f"no project {key!r}")
         allowed = {"name", "dir", "status", "owner", "due", "milestones",
-                   "notion_project_id", "goal"}
+                   "notion_project_id", "goal", "lane"}
         bad = set(fields) - allowed
         if bad:
             raise StoreError(f"cannot set {sorted(bad)} on a project")
         if "status" in fields and fields["status"] not in PROJECT_STATUSES:
             raise StoreError(f"bad project status {fields['status']!r}")
+        if fields.get("lane") is not None and fields["lane"] not in LANES:
+            raise StoreError(f"bad lane {fields['lane']!r} ({', '.join(LANES)})")
         if "milestones" in fields and not isinstance(fields["milestones"], str):
             fields["milestones"] = json.dumps(fields["milestones"], ensure_ascii=False)
         if not fields:
@@ -894,7 +1061,11 @@ class Store:
             "confirmed": 0 if fields.get("confirmed") == 0 else 1,
             "created_at": now, "updated_at": now,
             "done_at": fields.get("done_at"),
+            "fixed": 1 if fields.get("fixed") else 0,
+            "external_ready_date": fields.get("external_ready_date"),
+            "done_when": fields.get("done_when"),
         }
+        depends_on = cols.pop("depends_on")
         placeholders = ",".join("?" * len(cols))
         cur = self.conn.execute(
             f"INSERT INTO tasks ({','.join(cols)}) VALUES ({placeholders})",
@@ -902,6 +1073,8 @@ class Store:
         task_id = cur.lastrowid
         self._audit(actor, "task.add", task_id, None,
                     {"project": project_key, "title": title, "status": status})
+        if depends_on:
+            self.add_dep(task_id, depends_on, actor=actor)
         self._commit_if_top()
         return self.task(task_id)
 
@@ -914,6 +1087,7 @@ class Store:
             "section", "display_ord", "load", "due", "planned_day",
             "depends_on", "waiting_on", "notes", "note_path", "brief_path",
             "notion_task_id", "source", "confirmed", "done_at",
+            "fixed", "external_ready_date", "done_when",
         }
         bad = set(fields) - allowed
         if bad:
@@ -925,6 +1099,16 @@ class Store:
             raise StoreError(f"bad load {fields['load']!r}")
         if fields.get("depends_on") == task_id:
             raise StoreError("a task cannot depend on itself")
+        if "fixed" in fields:
+            fields["fixed"] = 1 if fields["fixed"] else 0
+        if "depends_on" in fields:
+            depends_on = fields.pop("depends_on")
+            if not fields:
+                self._set_sole_predecessor(task_id, depends_on, actor)
+                return self.task(task_id)
+            with self.write():
+                self._set_sole_predecessor(task_id, depends_on, actor)
+                return self.update_task(task_id, actor=actor, **fields)
         if "owner" in fields:
             fields["owner"] = self.normalize_owner(fields["owner"])
         if not fields:
@@ -1494,6 +1678,8 @@ class Store:
                           self.conn.execute("SELECT * FROM questions ORDER BY id")],
             "sessions": [dict(r) for r in
                          self.conn.execute("SELECT * FROM sessions ORDER BY last_seen")],
+            "deps": [dict(r) for r in self.conn.execute(
+                "SELECT * FROM deps ORDER BY task_id, depends_on_id")],
         }
 
     def write_snapshot(self):
@@ -1573,6 +1759,11 @@ def open_store(root=None, db_path=None, seed_settings=True,
     have = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
     if "notes" not in have:
         conn.execute("ALTER TABLE tasks ADD COLUMN notes TEXT")
+    for table, columns in (("tasks", TASK_V3), ("projects", PROJECT_V3)):
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     store = Store(conn, root)
     migrate_schema(store)
@@ -1626,9 +1817,47 @@ def migrate_schema(store):
         rows = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         if version < SCHEMA_VERSION or lines > rows:
             synced = sync_events_from_audit(store)
+    if version < 3:
+        move_legacy_depends_on(store)
     if version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return synced
+
+
+def move_legacy_depends_on(store):
+    """
+    Schema 3: tasks.depends_on -> deps, once.
+
+    A single id naming a live row moves across with a zero gap. Anything
+    else (the comma-joined strings on the closed aba-champions rows, an id
+    whose row is gone) is dropped, as MQ ruled 2026-09-24: those rows are
+    closed and the value carries nothing but the format lesson. The column
+    is cleared either way, through update_task's audit path so the old
+    value is in the log if it is ever wanted. Returns (moved, dropped).
+    """
+    rows = store.conn.execute(
+        "SELECT id, depends_on FROM tasks WHERE depends_on IS NOT NULL "
+        "AND depends_on <> ''").fetchall()
+    moved = dropped = 0
+    with store.write():
+        for row in rows:
+            value = str(row["depends_on"]).strip()
+            target = int(value) if value.isdigit() else None
+            keep = (target is not None and target != row["id"]
+                    and store.task(target) is not None)
+            if keep:
+                store.add_dep(row["id"], target, actor="migration")
+                moved += 1
+            else:
+                dropped += 1
+            store.conn.execute("UPDATE tasks SET depends_on = NULL WHERE id = ?",
+                               (row["id"],))
+            store._audit("migration", "task.update", row["id"],
+                         {"depends_on": row["depends_on"]}, {"depends_on": None},
+                         kind="update",
+                         summary="legacy depends_on moved to deps" if keep
+                         else "legacy depends_on dropped")
+    return moved, dropped
 
 
 def sync_events_from_audit(store):

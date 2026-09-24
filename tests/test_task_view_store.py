@@ -574,11 +574,12 @@ class TestVerbs(StoreCase):
         self.assertIn("Build the other thing", (self.repo / "proj" / "task-list.md").read_text())
         other = self.store.add_task("proj", "Blocker", display_ord="2")
         self.run_cli("task", "set", "proj#1", "--depends-on", "proj#2")
-        self.assertEqual(self.store.task(self.task["id"])["depends_on"], other["id"])
+        self.assertEqual([d["depends_on_id"] for d in self.store.deps(task_id=self.task["id"])],
+                         [other["id"]])
         self.run_cli("task", "set", "proj#1", "--due", "none", "--depends-on", "none")
         t = self.store.task(self.task["id"])
         self.assertIsNone(t["due"])
-        self.assertIsNone(t["depends_on"])
+        self.assertEqual(self.store.deps(task_id=self.task["id"]), [])
 
     def test_task_set_refuses_nothing_and_empty_titles(self):
         code, _ = self.run_cli("task", "set", "proj#1")

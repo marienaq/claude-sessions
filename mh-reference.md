@@ -42,13 +42,13 @@ works as-is.
 | `mh task next <project>` | `--all` | the next action for a project |
 | `mh task find <words>` | `--include-done` `--limit` | search open tasks by words |
 | `mh task list <project>` | `--day` `--include-done` `--owner` | list tasks |
-| `mh task add <project> <title>` | `--day` `--due` `--load` `--note` `--owner` `--source` `--unconfirmed` | create a task |
+| `mh task add <project> <title>` | `--day` `--done-when` `--due` `--fixed` `--load` `--note` `--owner` `--ready` `--source` `--unconfirmed` | create a task |
 | `mh task done <task>` | — | close a task |
 | `mh task status <task> <status>` | `--waiting-on` | set a task's status |
 | `mh task note <task> <text>` | — | append a dated entry to the note file |
 | `mh task plan <task> <day>` | — | put a task on a day, or take it off |
 | `mh task load <task> <load>` | — | set a task's load tag |
-| `mh task set <task>` | `--depends-on` `--due` `--notes` `--notion` `--section` `--title` | change a task's title, notes, due, section, dependency or Notion id |
+| `mh task set <task>` | `--depends-on` `--done-when` `--due` `--fixed` `--notes` `--notion` `--ready` `--section` `--title` | change a task's title, notes, due, section, dependency or Notion id |
 | `mh task owner <task> <owner>` | — | hand a task to someone (mq, or a person's name) |
 | `mh task seq <task> <seq>` | — | set ordering within a project |
 | `mh task confirm <task>` | — | accept a capture proposal |
@@ -89,8 +89,24 @@ works as-is.
 |---|---|---|
 | `mh project add <key> <name>` | `--dir` `--due` `--goal` `--notion` `--owner` `--status` | register a new project |
 | `mh project list` | `--all` | every live project, with its next action |
-| `mh project set <project>` | `--dir` `--due` `--goal` `--name` `--notion` `--owner` | rename a project, move its directory, or fix due, goal, owner |
+| `mh project set <project>` | `--dir` `--due` `--goal` `--lane` `--name` `--notion` `--owner` | rename a project, move its directory, or fix due, goal, owner |
 | `mh project status <project> <status>` | — | set a project's status |
+
+### `mh dep`
+
+| Command | Options | What it does |
+|---|---|---|
+| `mh dep add <task>` | `--gap` `--on` `--same-day` | a task waits on another, by at least --gap days |
+| `mh dep rm <task>` | `--on` | remove a dependency |
+| `mh dep list <target>` | — | what a task or project waits on, and blocks |
+
+### `mh schedule`
+
+| Command | Options | What it does |
+|---|---|---|
+| `mh schedule validate` | `--from` `--project` | every rule the committed schedule breaks; read-only |
+| `mh schedule rules` | — | the rules in force, and where each comes from |
+| `mh schedule set <name> <value>` | — | change a rule: day_cap, week_target, days... |
 
 ### Single commands
 

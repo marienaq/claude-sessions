@@ -82,20 +82,20 @@ class TestWrites(CliCase):
         Without one the row has no key#N, so it cannot be referenced by the
         convention every skill and every day-card line uses.
         """
-        code, out = self.run_cli("task", "add", "proj", "New work", "--no-regen")
+        code, out = self.run_cli("task", "add", "proj", "New work", "--no-regen", "--load", "shallow", "--done-when", "It exists")
         self.assertEqual(code, 0)
         self.assertIn("proj#1", out, "first row in an empty project")
-        code, out = self.run_cli("task", "add", "proj", "More work", "--no-regen")
+        code, out = self.run_cli("task", "add", "proj", "More work", "--no-regen", "--load", "shallow", "--done-when", "It exists")
         self.assertIn("proj#2", out, "the number continues")
 
     def test_add_numbers_continue_from_the_highest(self):
         self.store.add_task("proj", "Existing", display_ord="17")
-        _, out = self.run_cli("task", "add", "proj", "Next one", "--no-regen")
+        _, out = self.run_cli("task", "add", "proj", "Next one", "--no-regen", "--load", "shallow", "--done-when", "It exists")
         self.assertIn("proj#18", out)
 
     def test_global_flags_work_after_the_subcommand(self):
         """`mh task add ... --no-regen` is what anyone writes by reflex."""
-        code, _ = self.run_cli("task", "add", "proj", "X",
+        code, _ = self.run_cli("task", "add", "proj", "X", "--load", "shallow", "--done-when", "It exists",
                                "--no-regen", "--actor", "orca")
         self.assertEqual(code, 0)
         line = self.store.audit_log.read_text().strip().splitlines()[-1]
