@@ -34,7 +34,14 @@ rm -rf "${DEST:?}/.git"
 
 # The mirror above deletes anything not in the source, which includes the
 # reference doc. Reinstall the entry point after every refresh.
-"$(dirname "${BASH_SOURCE[0]}")/install-mh.sh" "$DEST" >/dev/null
+#
+# Always from the main checkout, never from the one this script runs in.
+# /opt/homebrew/bin/mh is a symlink to the dev copy's shim, so the shim's
+# INSTALLED_FROM is what every agent's bare `mh` runs. Installed from a
+# feature worktree, it put unmerged code on every agent's write path and
+# migrated the live store (2026-09-24). Test a worktree with MH_CODE.
+MAIN="${CSM_MAIN_CHECKOUT:-$HOME/Projects/claude-sessions}"
+"$MAIN/install-mh.sh" "$DEST" >/dev/null
 
 echo "done: $(du -sh "$DEST" | cut -f1), $(find "$DEST" -name '*.md' | wc -l | tr -d ' ') markdown files"
 echo "git repo: $(git -C "$DEST" rev-parse --git-dir 2>/dev/null || echo 'none (cannot be pushed)')"
