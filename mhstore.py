@@ -3,8 +3,8 @@
 mhstore — the task record behind the session manager.
 
 SQLite, stdlib only, to match server.py's no-dependency rule. One file at
-<repo>/operations/tasks.db, so it sits in the same Drive backup path as the
-markdown it replaces.
+<repo>/operations/tasks.db. It is gitignored; mhbackup.py is what takes it
+off the machine.
 
 Three things guard against this being a one-way door:
   - every write appends a line to operations/tasks-audit.log
