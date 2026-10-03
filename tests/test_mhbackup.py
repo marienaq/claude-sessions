@@ -5,6 +5,7 @@ Tests for mhbackup.
 Run: python3 -m unittest discover -s tests -v
 """
 
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -47,6 +48,21 @@ class Backup(unittest.TestCase):
         self.assertEqual((self.dest / "tasks-audit-2026-10-03.log").read_text(), self.audit)
         self.assertEqual(sorted(p.name for p in self.dest.iterdir()),
                          ["tasks-2026-10-03.db", "tasks-audit-2026-10-03.log"])
+
+    def test_restored_snapshot_is_a_working_store(self):
+        # The README's restore steps, on a repo that has never seen the store.
+        mhbackup.backup(self.root, self.dest, today=date(2026, 10, 3))
+        other = Path(self._tmp.name) / "other-laptop"
+        (other / "operations").mkdir(parents=True)
+        shutil.copyfile(self.dest / "tasks-2026-10-03.db",
+                        other / "operations" / "tasks.db")
+        restored = mhstore.open_store(other)
+        try:
+            self.assertEqual([t["title"] for t in restored.tasks("p")], ["one"])
+            restored.add_task("p", "two")
+            self.assertEqual(len(restored.tasks("p")), 2)
+        finally:
+            restored.conn.close()
 
     def test_missing_destination_fails_instead_of_creating_it(self):
         gone = self.dest / "not-mounted"
