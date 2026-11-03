@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import sys
 import time
+import traceback
 import urllib.parse
 from pathlib import Path
 
@@ -584,6 +585,49 @@ def _week_from_store(store, week_start):
     return days
 
 
+def _parse_day(value):
+    """A YYYY-MM-DD string as a date, or None if it is not one."""
+    import datetime
+    try:
+        return datetime.date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_DATE_FIX = {
+    "planned_day": ("planned day", "mh task plan {ref} none"),
+    "due": ("due date", "mh task set {ref} --due none"),
+    "external_ready_date": ("ready date", "mh task set {ref} --ready none"),
+}
+
+
+def data_problems():
+    """
+    Rows the dashboard cannot read, each with the mh command that fixes it.
+
+    Shown in the alert bar at the top of the page. The store refuses bad dates
+    now, but rows written before that, or by hand, can still hold one.
+    """
+    store = get_store()
+    if store is None or not store_is_live():
+        return []
+    problems = []
+    for row in store.conn.execute(
+            "SELECT id, project_key, display_ord, title, planned_day, due, "
+            "external_ready_date FROM tasks WHERE status NOT IN ('done', 'canceled')"):
+        ref = (f"{row['project_key']}#{row['display_ord']}"
+               if row["display_ord"] else str(row["id"]))
+        for field, (label, fix) in _DATE_FIX.items():
+            value = row[field]
+            if value is not None and _parse_day(value) is None:
+                problems.append({
+                    "message": f"{ref} \u201c{row['title'][:60]}\u201d has "
+                               f"{label} {value!r}, which is not a date.",
+                    "fix": fix.format(ref=ref),
+                })
+    return problems
+
+
 def load_priorities():
     """
     The current and next week, read from the store.
@@ -605,8 +649,11 @@ def load_priorities():
     if not planned:
         return parse_priorities_markdown()
 
-    starts = sorted({_week_start_for(datetime.date.fromisoformat(p))
-                     for p in planned})
+    # A day that is not a date is skipped here and reported by
+    # data_problems(), so one bad row cannot take down the whole dashboard.
+    starts = sorted({_week_start_for(d) for d in map(_parse_day, planned) if d})
+    if not starts:
+        return parse_priorities_markdown()
     current = [s for s in starts if s <= this_monday]
     if current:
         selected, has_current = [current[-1]], True
@@ -2314,16 +2361,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _do_GET(self):
         if self.path == "/api/sessions":
-            store = load_store()
-            self.send_json({
-                "sessions": get_all_sessions(),
-                "priorities": parse_priorities(),
-                "panels": load_panels(),
+            # Each section is built on its own, so one that fails costs only
+            # itself and says why in `errors`, which the page shows at the top.
+            # Before, any exception dropped the connection and the page kept
+            # only the project list.
+            errors = []
+
+            def section(name, build, fallback):
+                try:
+                    return build()
+                except Exception as exc:
+                    traceback.print_exc()
+                    errors.append({"message": f"Could not load {name}: "
+                                              f"{type(exc).__name__}: {exc}"})
+                    return fallback
+
+            store = section("settings", load_store, {})
+            payload = {
+                "sessions": section("sessions", get_all_sessions, []),
+                "priorities": section("the week's to-dos", parse_priorities, {}),
+                "panels": section("the task panels", load_panels, None),
                 "colorGroups": store.get("color_groups", {}),
-                "user": dict(zip(("id", "name"), primary_user()),
-                             agent=(TASK_AGENT.title()
-                                    if agent_available(TASK_AGENT) else None)),
-            })
+                "user": section("the user", lambda: dict(
+                    zip(("id", "name"), primary_user()),
+                    agent=(TASK_AGENT.title()
+                           if agent_available(TASK_AGENT) else None)), None),
+            }
+            errors[:0] = section("the data check", data_problems, [])
+            payload["errors"] = errors
+            self.send_json(payload)
         elif self.path == "/api/task-files":
             files = []
             # Sessions almost always run at the repo root rather than inside a
@@ -3257,6 +3323,27 @@ body {
 }
 
 /* Header */
+.data-alerts {
+    margin: 12px 24px 0;
+    padding: 10px 14px;
+    border: 1px solid var(--red);
+    border-left-width: 4px;
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+}
+.data-alerts strong { color: var(--red); }
+.data-alerts ul { margin: 6px 0 0; padding-left: 18px; }
+.data-alerts li { margin: 4px 0; }
+.data-alerts code {
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    background: var(--surface-hover);
+    padding: 1px 5px;
+    border-radius: 4px;
+    user-select: all;
+}
 .header {
     padding: 20px 24px 0;
     display: flex;
@@ -4243,6 +4330,7 @@ body {
         <span id="themeIcon">&#9789;</span>
     </button>
 </div>
+<div id="dataAlerts" class="data-alerts" role="alert" hidden></div>
 
 <div id="boardView">
 <div id="prioritiesBar" class="priorities-bar"></div>
@@ -4361,9 +4449,18 @@ let me = {id: 'mq', name: 'MQ', agent: 'Orca'};
 async function fetchSessions(force = false) {
     if (isEditing && !force) return;
     try {
-        const res = await fetch('/api/sessions');
-        const data = await res.json();
-        sessions = data.sessions;
+        let data;
+        try {
+            const res = await fetch('/api/sessions');
+            if (!res.ok) throw new Error('the server answered ' + res.status);
+            data = await res.json();
+        } catch (e) {
+            renderDataAlerts([{message: 'Could not load sessions and to-dos (' +
+                e.message + '). Check ~/.claude-manager/server.err.log.'}]);
+            throw e;
+        }
+        renderDataAlerts(data.errors || []);
+        sessions = data.sessions || [];
         colorGroups = data.colorGroups || {};
         priorities = data.priorities || {};
         panels = data.panels || {available: false, backlog: [], proposed: [], projects: []};
@@ -4389,6 +4486,23 @@ async function fetchSessions(force = false) {
     } catch(e) {
         console.error('Fetch error:', e);
     }
+}
+
+// Problems the server found building /api/sessions, each with the command
+// that fixes it when there is one. Hidden when there are none.
+let lastAlertsJson = '';
+function renderDataAlerts(errors) {
+    const json = JSON.stringify(errors);
+    if (json === lastAlertsJson) return;
+    lastAlertsJson = json;
+    const box = document.getElementById('dataAlerts');
+    if (!box) return;
+    if (!errors.length) { box.hidden = true; box.innerHTML = ''; return; }
+    const items = errors.map(e => '<li>' + escHtml(e.message) +
+        (e.fix ? ' Fix: <code>' + escHtml(e.fix) + '</code>' : '') + '</li>').join('');
+    box.innerHTML = '<strong>' + (errors.length === 1 ? 'Something needs fixing'
+        : errors.length + ' things need fixing') + '</strong><ul>' + items + '</ul>';
+    box.hidden = false;
 }
 
 function getTagColor(tag) {

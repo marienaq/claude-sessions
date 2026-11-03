@@ -41,7 +41,9 @@ from mhstore import ONE_OFF, OPEN_STATUSES, StoreError
 # "aba-academy#25", "#230" and "230" all address a task. The bare-hash form
 # matters because that is what this tool prints for a row with no per-project
 # number, and output you cannot paste back in is a trap.
-IDENT = re.compile(r"^(?:([a-z0-9][a-z0-9-]*))?#?(\d+)$")
+# The # is required whenever a key is given. With it optional, a bare store
+# id like 574 parsed as key "57", row 4, and failed as "no task 57#4".
+IDENT = re.compile(r"^(?:([a-z0-9][a-z0-9-]*)?#)?(\d+)$")
 
 
 class CliError(Exception):
@@ -370,7 +372,9 @@ def cmd_task_plan(store, repo, args):
     finalize and the Friday job could not write a proposed week at all.
     """
     task = resolve(store, args.task)
-    if args.day:
+    # 'none' clears here as it does for every other mh field. Before, it was
+    # stored as the day itself, and the dashboard could not parse it.
+    if args.day and args.day.lower() != "none":
         store.plan_task(task["id"], args.day, actor=args.actor)
     else:
         store.unplan_task(task["id"], actor=args.actor)
@@ -1632,7 +1636,7 @@ def build_parser():
 
     p = task.add_parser("plan", help="put a task on a day, or take it off", parents=[common])
     p.add_argument("task")
-    p.add_argument("day", nargs="?", help="YYYY-MM-DD; omit to unschedule")
+    p.add_argument("day", nargs="?", help="YYYY-MM-DD; omit or 'none' to unschedule")
     p.set_defaults(fn=cmd_task_plan)
 
     p = task.add_parser("load", help="set a task's load tag", parents=[common])

@@ -380,3 +380,37 @@ class TestSessionMatching(ServerCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestBadDateRow(ServerCase):
+    """A row whose planned_day was the word 'none' blanked the whole page."""
+
+    def setUp(self):
+        super().setUp()
+        store = self.build_store()
+        store.add_project("proj", "A Project", dir="proj")
+        store.add_task("proj", "Good thing", display_ord="1",
+                       planned_day=_monday().isoformat(), status="planned")
+        bad = store.add_task("proj", "Bad thing", display_ord="2", status="waiting")
+        # Written before the store refused it, as task 574 was.
+        store.conn.execute("UPDATE tasks SET planned_day = 'none' WHERE id = ?",
+                           (bad["id"],))
+        store.conn.commit()
+
+    def test_priorities_still_load(self):
+        p = self.load_server().load_priorities()
+        texts = [i["text"] for d in p["weeks"][0]["days"] for i in d["items"]]
+        self.assertIn("Good thing", texts)
+
+    def test_problem_is_reported_with_its_fix(self):
+        problems = self.load_server().data_problems()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("proj#2", problems[0]["message"])
+        self.assertIn("'none'", problems[0]["message"])
+        self.assertEqual(problems[0]["fix"], "mh task plan proj#2 none")
+
+    def test_clean_store_has_no_problems(self):
+        self.store.conn.execute("UPDATE tasks SET planned_day = NULL "
+                                "WHERE planned_day = 'none'")
+        self.store.conn.commit()
+        self.assertEqual(self.load_server().data_problems(), [])

@@ -68,6 +68,13 @@ class TestIdentifiers(CliCase):
         self.store.add_task("proj", "Findable", display_ord="7")
         self.assertEqual(mhcli.resolve(self.store, "`proj#7`")["display_ord"], "7")
 
+    def test_bare_multi_digit_id_is_a_store_id(self):
+        """574 once parsed as key '57', row 4, and failed as 'no task 57#4'."""
+        for _ in range(11):
+            last = self.store.add_task("proj", "Filler")
+        self.assertGreaterEqual(last["id"], 10)
+        self.assertEqual(mhcli.resolve(self.store, str(last["id"]))["id"], last["id"])
+
     def test_unknown_row_is_an_error(self):
         with self.assertRaises(mhcli.CliError):
             mhcli.resolve(self.store, "proj#999")
@@ -165,6 +172,21 @@ class TestPlanning(CliCase):
         task = self.store.tasks(project_key="proj")[0]
         self.assertEqual(task["planned_day"], "2026-09-04")
         self.assertEqual(task["status"], "planned")
+
+    def test_plan_none_unschedules(self):
+        """'none' clears everywhere else in mh; it used to be stored as the day."""
+        self.store.add_task("proj", "Schedulable", display_ord="1",
+                            planned_day="2026-09-04", status="planned")
+        self.run_cli("task", "plan", "proj#1", "none", "--no-regen")
+        task = self.store.tasks(project_key="proj")[0]
+        self.assertIsNone(task["planned_day"])
+        self.assertEqual(task["status"], "backlog")
+
+    def test_plan_rejects_a_day_that_is_not_a_date(self):
+        self.store.add_task("proj", "Schedulable", display_ord="1")
+        code, _ = self.run_cli("task", "plan", "proj#1", "tomorrow", "--no-regen")
+        self.assertNotEqual(code, 0)
+        self.assertIsNone(self.store.tasks(project_key="proj")[0]["planned_day"])
 
     def test_plan_with_no_day_unschedules(self):
         self.store.add_task("proj", "Schedulable", display_ord="1",

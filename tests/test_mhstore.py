@@ -502,3 +502,36 @@ class TestPersistence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestDatesAreDates(unittest.TestCase):
+    """The dashboard parses these; one bad value used to blank it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = mhstore.open_store(root=Path(self._tmp.name))
+        self.store.add_project("proj", "A Project", dir="proj")
+
+    def tearDown(self):
+        self.store.close()
+        self._tmp.cleanup()
+
+    def test_update_refuses_a_non_date(self):
+        task = self.store.add_task("proj", "Thing")
+        for field in mhstore.DATE_FIELDS:
+            for bad in ("none", "2026-13-01", "2026-9-4", "Friday"):
+                with self.assertRaises(mhstore.StoreError, msg=f"{field}={bad}"):
+                    self.store.update_task(task["id"], **{field: bad})
+        self.assertIsNone(self.store.task(task["id"])["planned_day"])
+
+    def test_add_refuses_a_non_date(self):
+        with self.assertRaises(mhstore.StoreError):
+            self.store.add_task("proj", "Thing", planned_day="none")
+
+    def test_real_dates_and_none_are_accepted(self):
+        task = self.store.add_task("proj", "Thing", due="2026-11-03")
+        self.store.plan_task(task["id"], "2026-11-04")
+        self.store.update_task(task["id"], due=None)
+        row = self.store.task(task["id"])
+        self.assertEqual(row["planned_day"], "2026-11-04")
+        self.assertIsNone(row["due"])

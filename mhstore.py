@@ -607,6 +607,29 @@ class StoreError(Exception):
     pass
 
 
+DATE_FIELDS = ("planned_day", "due", "external_ready_date")
+
+
+def _check_dates(fields):
+    """
+    Refuse a date field that is not YYYY-MM-DD (None clears it).
+
+    The dashboard parses planned_day as a date. One row holding the word
+    'none' made every /api/sessions call fail, which blanked the sessions and
+    the to-dos until the row was found by hand.
+    """
+    for name in DATE_FIELDS:
+        value = fields.get(name)
+        if value is None:
+            continue
+        try:
+            ok = date.fromisoformat(value).isoformat() == value
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise StoreError(f"bad {name} {value!r}: use YYYY-MM-DD")
+
+
 class Store:
     """
     Every mutating method takes actor= and writes one audit line. Nothing
@@ -1027,6 +1050,7 @@ class Store:
         load = fields.get("load")
         if load is not None and load not in LOADS:
             raise StoreError(f"bad load {load!r}")
+        _check_dates(fields)
 
         # Give the row a per-project number if the caller did not. Without one
         # a task created in the UI or the CLI has no key#N, so it cannot be
@@ -1099,6 +1123,7 @@ class Store:
             raise StoreError(f"bad load {fields['load']!r}")
         if fields.get("depends_on") == task_id:
             raise StoreError("a task cannot depend on itself")
+        _check_dates(fields)
         if "fixed" in fields:
             fields["fixed"] = 1 if fields["fixed"] else 0
         if "depends_on" in fields:
