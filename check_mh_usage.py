@@ -28,7 +28,9 @@ from pathlib import Path
 import mhcli
 
 # `mh task done aba-academy#25`, in prose, a fenced block, or backticks.
-INVOCATION = re.compile(r"(?<![\w./-])mh\s+([a-z][\w \-#<>|/\"'=.:{}]*)")
+# Quoted arguments can hold any punctuation ("Pitched 11/23, card"); cut_prose
+# then trims the prose that follows the command, outside quotes only.
+INVOCATION = re.compile(r"(?<![\w./-])mh\s+([a-z][\w \-#<>|/\"'=.:{}(),;!?@+&%~*$]*)")
 
 # What a placeholder stands for, so the shape can still be checked.
 PLACEHOLDERS = {
@@ -55,6 +57,52 @@ PLACEHOLDERS = {
 }
 
 
+TOKEN = re.compile(r"\x00(\d+)\x00")
+
+
+def tokenize(command):
+    """Replace each <placeholder> with a token that survives shlex as one word,
+    so the value can be chosen once it is known which argument it fills."""
+    names = []
+    def swap(match):
+        names.append(match.group(1))
+        return f"\x00{len(names) - 1}\x00"
+    return re.sub(r"<([^>]+)>", swap, command), names
+
+
+def value_for(name, action=None):
+    choices = list(getattr(action, "choices", None) or [])
+    plain = substitute(f"<{name}>")
+    if choices:
+        return plain if plain in choices else str(choices[0])
+    return plain
+
+
+def fill(argv, names, leaf):
+    """Fill tokens: a whole-word token takes a value its argument accepts."""
+    positionals = [a for a in leaf._actions if not a.option_strings and a.dest != "help"]
+    by_option = {o: a for a in leaf._actions for o in a.option_strings}
+    out, pos, pending = [], 0, None
+    for word in argv:
+        action = None
+        if pending is not None:
+            action, pending = pending, None
+        elif word.startswith("-"):
+            opt = by_option.get(word.split("=")[0])
+            if opt is not None and opt.nargs != 0 and "=" not in word \
+                    and not isinstance(opt, argparse._StoreTrueAction):
+                pending = opt
+        else:
+            action = positionals[pos] if pos < len(positionals) else None
+            pos += 1
+        m = TOKEN.fullmatch(word)
+        if m:
+            out.append(value_for(names[int(m.group(1))], action))
+        else:
+            out.append(TOKEN.sub(lambda m: substitute(f"<{names[int(m.group(1))]}>"), word))
+    return out
+
+
 def substitute(command):
     """Replace <placeholders> with something the parser will accept."""
     def swap(match):
@@ -69,6 +117,28 @@ def substitute(command):
     return re.sub(r"<([^>]+)>", swap, command)
 
 
+# Prose punctuation, and shell plumbing (a redirect or pipe ends the mh part).
+PROSE_END = re.compile(r"\s+[—–]|\.\s|,\s|;\s|\)\s|`|\s[<>|]\s|\s&&\s|\.$|,$|\)$")
+
+
+def cut_prose(command):
+    """Cut at the first prose punctuation that is outside quotes, so a comma
+    inside `--link "Your post, M/D"` is part of the argument."""
+    quote = None
+    for i, ch in enumerate(command):
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            continue
+        m = PROSE_END.match(command, i)
+        if m:
+            return command[:i]
+    return command
+
+
 def extract(text):
     """Every mh invocation in a file, with its line number."""
     found = []
@@ -77,7 +147,7 @@ def extract(text):
         for match in INVOCATION.finditer(stripped):
             command = match.group(0)
             # Stop at prose punctuation that cannot be part of a command.
-            command = re.split(r"\s+[—–]|\.\s|,\s|;\s|\)\s|`", command)[0]
+            command = cut_prose(command)
             found.append((number, command.strip().rstrip(".,;:`)")))
     return found
 
@@ -116,8 +186,9 @@ def check(command, parser):
     eleven of thirteen findings in the handoff brief false positives, which
     is how a checker gets ignored.
     """
+    tokenized, names = tokenize(command)
     try:
-        argv = shlex.split(substitute(command))
+        argv = shlex.split(tokenized)
     except ValueError as exc:
         return f"unparseable: {exc}"
     if not argv or argv[0] != "mh":
@@ -126,9 +197,16 @@ def check(command, parser):
     if not argv:
         return "bare `mh` with no subcommand"
 
-    leaf, rest, bad = walk(parser, argv)
+    head = [TOKEN.sub(lambda m: substitute(f"<{names[int(m.group(1))]}>"), w) for w in argv]
+    leaf, rest, bad = walk(parser, head)
     if bad:
         return f"no such command: `{bad}`"
+    # Now that the command is known, give each placeholder a value its
+    # argument accepts (`<status>` is a task status for `mh task`, an idea
+    # status for `mh content idea`).
+    rest = fill(argv[len(argv) - len(rest):], names, leaf)
+    argv = argv[:len(argv) - len(rest)] + rest
+    argv = [TOKEN.sub(lambda m: substitute(f"<{names[int(m.group(1))]}>"), w) for w in argv]
 
     # The command path is real. If the invocation supplies every required
     # positional it is a prescription, so hand it to argparse, which validates

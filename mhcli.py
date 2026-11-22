@@ -32,6 +32,7 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
+import mhcontent
 import mhgen
 import mhschedule
 import mhsession
@@ -1328,18 +1329,36 @@ def _render_reference():
         blurbs = {a.dest: (a.help or "") for a in nested._choices_actions}
         lines += [f"### `mh {name}`", "",
                   "| Command | Options | What it does |", "|---|---|---|"]
-        for action_name, leaf in nested.choices.items():
+        # `mh content idea set` goes one level deeper than the rest, so a
+        # leaf that is itself a group is walked into.
+        def leaves(prefix, choices, blurbs):
+            for action_name, leaf in choices.items():
+                deeper = next((a for a in leaf._actions
+                               if isinstance(a, argparse._SubParsersAction)), None)
+                if deeper is not None:
+                    yield from leaves(f"{prefix} {action_name}", deeper.choices,
+                                      {a.dest: (a.help or "") for a in deeper._choices_actions})
+                    continue
+                yield f"{prefix} {action_name}", leaf, blurbs.get(action_name, "")
+
+        for signature, leaf, blurb in leaves(f"mh {name}", nested.choices, blurbs):
             positional = [a.dest for a in leaf._actions
                           if not a.option_strings and a.dest != "help"]
             flags = sorted({o for a in leaf._actions for o in a.option_strings
                             if o.startswith("--")
                             and o not in ("--help", "--repo", "--actor",
                                           "--no-regen", "--json")})
-            signature = " ".join([f"mh {name} {action_name}"]
-                                 + [f"<{d}>" for d in positional])
+            optional = {a.dest for a in leaf._actions if a.nargs in ("?", "*")}
+            signature = " ".join([signature] + [f"[<{d}>]" if d in optional else f"<{d}>"
+                                                for d in positional])
+            # A required option is part of the shape, so show it there: a
+            # skill copying the signature then gets a command that runs.
+            for a in leaf._actions:
+                if a.option_strings and a.required:
+                    signature += f" {a.option_strings[-1]} <{a.dest}>"
             lines.append(f"| `{signature}` | "
                          f"{' '.join(f'`{f}`' for f in flags) or '—'} | "
-                         f"{blurbs.get(action_name, '') or '—'} |")
+                         f"{blurb or '—'} |")
         lines.append("")
 
     if flat:
@@ -1862,6 +1881,8 @@ def build_parser():
     p.add_argument("--self-paced", action="store_true")
     p.set_defaults(fn=cmd_template_link)
 
+    mhcontent.add_parser(sub, common)
+
     p = sub.add_parser("report", help="a week summary for Slack", parents=[common])
     p.add_argument("week", nargs="?")
     p.set_defaults(fn=cmd_report, group="report", action=None)
@@ -1904,6 +1925,11 @@ def main(argv=None):
     if args.group == "docs":
         print(render_reference(*_reference_user(args)))
         return 0
+
+    # The content app's database lives in Supabase, not the task store, so it
+    # needs no repo and runs before any check on one.
+    if args.group == "content":
+        return mhcontent.run(args)
 
     if args.group == "check-skills":
         import check_mh_usage

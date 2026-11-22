@@ -27,10 +27,23 @@ find_repo() {
     echo ""
 }
 
+# The first word that isn't a global flag (or a global flag's value).
+# `mh content` talks to the app's database and needs no task store; only
+# that first word counts, so "content" inside a task title doesn't.
+first_command() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo|--actor) [ $# -ge 2 ] && shift 2 || return 0 ;;
+            --*) shift ;;
+            *) echo "$1"; return ;;
+        esac
+    done
+}
+
 REPO="$(find_repo)"
 if [ -n "$REPO" ]; then
     export MELLONHEAD_ROOT="$REPO"
-elif [[ " $* " != *" --repo "* ]]; then
+elif [[ " $* " != *" --repo "* && "$(first_command "$@")" != "content" ]]; then
     echo "mh: no task store found." >&2
     echo "Looked for operations/tasks.db from $PWD upwards." >&2
     echo "Set MELLONHEAD_ROOT, pass --repo, or run from inside the repo." >&2

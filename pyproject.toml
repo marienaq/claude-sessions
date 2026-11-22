@@ -17,7 +17,7 @@ dependencies = []
 mh = "mhcli:main"
 
 [tool.setuptools]
-py-modules = ["mhstore", "mhgen", "mhmigrate", "mhbackup", "mhcli", "check_mh_usage"]
+py-modules = ["mhstore", "mhgen", "mhmigrate", "mhbackup", "mhcli", "mhcontent", "check_mh_usage"]
 
 [tool.setuptools.package-data]
 "*" = ["mh-reference.md"]

@@ -39,23 +39,23 @@ works as-is.
 
 | Command | Options | What it does |
 |---|---|---|
-| `mh task next <project>` | `--all` | the next action for a project |
+| `mh task next [<project>]` | `--all` | the next action for a project |
 | `mh task find <words>` | `--include-done` `--limit` | search open tasks by words |
-| `mh task list <project>` | `--day` `--include-done` `--owner` | list tasks |
-| `mh task add <project> <title>` | `--day` `--done-when` `--due` `--fixed` `--load` `--note` `--owner` `--ready` `--source` `--unconfirmed` | create a task |
+| `mh task list [<project>]` | `--day` `--include-done` `--owner` | list tasks |
+| `mh task add [<project>] <title>` | `--day` `--done-when` `--due` `--fixed` `--load` `--note` `--owner` `--ready` `--source` `--unconfirmed` | create a task |
 | `mh task done <task>` | — | close a task |
 | `mh task status <task> <status>` | `--waiting-on` | set a task's status |
 | `mh task note <task> <text>` | — | append a dated entry to the note file |
-| `mh task plan <task> <day>` | — | put a task on a day, or take it off |
+| `mh task plan <task> [<day>]` | — | put a task on a day, or take it off |
 | `mh task load <task> <load>` | — | set a task's load tag |
 | `mh task set <task>` | `--depends-on` `--done-when` `--due` `--fixed` `--notes` `--notion` `--ready` `--section` `--title` | change a task's title, notes, due, section, dependency or Notion id |
 | `mh task owner <task> <owner>` | — | hand a task to someone (mq, or a person's name) |
 | `mh task seq <task> <seq>` | — | set ordering within a project |
 | `mh task confirm <task>` | — | accept a capture proposal |
 | `mh task brief <task> <path>` | — | record a brief file path (must exist, under the repo) |
-| `mh task dispatch <task>` | `--expect` `--summary` `--to` | record that work went to an agent |
-| `mh task deliver <task>` | `--agent` `--artifact` `--summary` | record a deliverable; closes the open dispatch |
-| `mh task review <task>` | `--agent` `--findings` `--summary` `--verdict` | record a reviewer's verdict |
+| `mh task dispatch <task> --to <to>` | `--expect` `--summary` `--to` | record that work went to an agent |
+| `mh task deliver <task> --artifact <artifact>` | `--agent` `--artifact` `--summary` | record a deliverable; closes the open dispatch |
+| `mh task review <task> --verdict <verdict>` | `--agent` `--findings` `--summary` `--verdict` | record a reviewer's verdict |
 | `mh task link <task>` | — | this conversation is about the task; run it when you start work |
 | `mh task unlink <task>` | — | this conversation is no longer about the task |
 
@@ -67,7 +67,7 @@ works as-is.
 | `mh question answer <id> <answer>` | `--source` | record MQ's answer |
 | `mh question accept <id>` | `--source` | answer = the proposed answer |
 | `mh question withdraw <id>` | `--reason` | the question no longer applies |
-| `mh question list <scope>` | `--all` `--open` | open questions, in the order the dashboard shows them |
+| `mh question list [<scope>]` | `--all` `--open` | open questions, in the order the dashboard shows them |
 
 ### `mh session`
 
@@ -81,7 +81,7 @@ works as-is.
 |---|---|---|
 | `mh plan lock <week>` | — | commit a proposed week |
 | `mh plan propose <week>` | `--force` `--notes` | mark a week proposed, awaiting MQ |
-| `mh plan show <week>` | — | the week's day cards |
+| `mh plan show [<week>]` | — | the week's day cards |
 
 ### `mh project`
 
@@ -96,8 +96,8 @@ works as-is.
 
 | Command | Options | What it does |
 |---|---|---|
-| `mh dep add <task>` | `--gap` `--on` `--same-day` | a task waits on another, by at least --gap days |
-| `mh dep rm <task>` | `--on` | remove a dependency |
+| `mh dep add <task> --on <on>` | `--gap` `--on` `--same-day` | a task waits on another, by at least --gap days |
+| `mh dep rm <task> --on <on>` | `--on` | remove a dependency |
 | `mh dep list <target>` | — | what a task or project waits on, and blocks |
 
 ### `mh schedule`
@@ -114,8 +114,42 @@ works as-is.
 |---|---|---|
 | `mh template list` | — | the templates there are |
 | `mh template show <name>` | `--self-paced` | a template's stages and what each waits on |
-| `mh template apply <name> <project>` | `--owner` `--prefix` `--self-paced` | create every stage row and its dependencies |
-| `mh template link <name> <project>` | `--prefix` `--self-paced` `--stage` | wire an in-flight course's existing rows to the template |
+| `mh template apply <name> <project> --prefix <prefix>` | `--owner` `--prefix` `--self-paced` | create every stage row and its dependencies |
+| `mh template link <name> <project> --prefix <prefix>` | `--prefix` `--self-paced` `--stage` | wire an in-flight course's existing rows to the template |
+
+### `mh content`
+
+| Command | Options | What it does |
+|---|---|---|
+| `mh content ideas` | `--all` `--channel` `--grep` `--link` `--status` `--week` | list ideas (not rejected or archived, unless asked) |
+| `mh content idea show <id>` | — | everything on one idea |
+| `mh content idea add <title>` | `--allow-duplicate` `--brief` `--channel` `--cta` `--feeling` `--harm-help` `--hers` `--id` `--link` `--on-camera` `--origin` `--pillar` `--safety` `--series` `--source-label` `--source-url` `--status` `--story` `--style` `--summary` `--take` `--type` `--voice` `--week` | add an idea; pitch fields given are marked drafted |
+| `mh content idea set <id> <field> <value>` | `--hers` | change one field (story: a key, none, or unset) |
+| `mh content idea status <id> <status>` | `--note` `--only-from` `--post-date` `--week` | move an idea, as the app does |
+| `mh content idea channels <id>` | `--add` `--hers` `--remove` | add or remove channels |
+| `mh content idea speaks-to <id>` | `--add` `--hers` `--remove` | which part of the inner world it speaks to |
+| `mh content idea link <id> <label> <url>` | — | add a link (or relabel one) |
+| `mh content idea unlink <id> <url>` | — | remove a link |
+| `mh content idea note <id> <text>` | `--who` | add a note |
+| `mh content idea put <id> <field> --file <file>` | `--file` `--force` | replace hooks, beats, script, prep, tips or look from JSON |
+| `mh content idea archive <id>` | — | hide an idea (nothing is deleted) |
+| `mh content takes` | `--all` | list takes |
+| `mh content take show <n>` | — | one take |
+| `mh content take add <short> <text>` | `--allow-duplicate` `--on-camera` `--pillar` | add a take (her words) |
+| `mh content take set <n>` | `--on-camera` `--pillar` `--short` `--text` | change a take: --short, --text, --pillar, --on-camera |
+| `mh content take archive <n>` | — | hide a take |
+| `mh content stories` | `--all` | list stories |
+| `mh content story show <key>` | — | one story |
+| `mh content story add <key> <title>` | `--known` `--missing` `--on-camera` `--pillar` | add a story (blinded unless --on-camera says otherwise) |
+| `mh content story set <key>` | `--known` `--missing` `--on-camera` `--pillar` `--title` | change a story: --title, --known, --missing, --pillar, --on-camera |
+| `mh content story archive <key>` | — | hide a story |
+| `mh content config` | — | the latest config version |
+| `mh content posts [<id>]` | — | list posts |
+| `mh content post add <id> <channel>` | `--hook-format` `--on` `--url` | record an idea going out on a channel |
+| `mh content post set <post>` | `--hook-format` `--on` `--url` | change a post's day, link or hook format ('' clears) |
+| `mh content post archive <post>` | — | hide a post |
+| `mh content signals <post>` | — | a post's signals, newest first |
+| `mh content signal add <post>` | `--any-metric` `--more` `--n` `--notice` `--on` `--said` | record a check on a post |
 
 ### Single commands
 
